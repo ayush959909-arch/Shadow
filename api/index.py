@@ -181,7 +181,7 @@ async def scan_url(body: ScanIn):
     raw = body.url.strip()
     if not raw:
         raise HTTPException(400, "Link khaali hai.")
-    url = raw if re.match(r"^https?://", raw, re.I) else "http://" + raw
+    url = raw if re.match(r"^https?://", raw, re.I) else "https://" + raw
     host = (urlparse(url).hostname or "").lower()
     if not host or "." not in host:
         raise HTTPException(400, "Ye valid link nahi lag raha.")
