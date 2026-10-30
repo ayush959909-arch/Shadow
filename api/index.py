@@ -10,6 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
+from email import message_from_string, policy
+from email.utils import parseaddr
+import html as html_lib
 
 app = FastAPI(title="ShadowX")
 VT_KEY = os.getenv("VT_API_KEY")
@@ -32,6 +35,7 @@ class Req(BaseModel):
     kind: str = "url"
     url: str = ""
     text: str = ""
+    sender: str = ""
     apk: Optional[dict] = None
 
 
@@ -238,19 +242,17 @@ UPI_RE = re.compile(r"\b[\w.\-]{2,}@(?:ok\w+|ybl|ibl|axl|paytm|upi|apl|sbi|hdfcb
 PHONE_RE = re.compile(r"(?<!\d)(?:\+91[\s-]?|0)?[6-9]\d{9}(?!\d)")
 
 
-async def analyze_text(text: str):
-    if len(text.strip()) < 10:
-        raise HTTPException(400, "Screenshot se text nahi nikla. Saaf aur bada screenshot try karo.")
-    text = text[:5000]
+async def text_findings(text: str, extra_links=None):
+    """Shared scam-pattern + link scan used by screenshot, SMS and email."""
     low = text.lower()
     findings: list = []
     for pat, lvl, msg, pts in TEXT_RULES:
         if re.search(pat, low):
             add(findings, lvl, msg, pts)
-    links = []
+    links = list(extra_links or [])
     for m in LINK_RE.findall(text):
         m = m.strip(".,;:)]}>\"'")
-        if m.lower() not in [x.lower() for x in links] and "@" not in m:
+        if "@" not in m and m.lower() not in [x.lower() for x in links]:
             links.append(m)
     upi = list(dict.fromkeys(UPI_RE.findall(text)))[:5]
     phones = list(dict.fromkeys(re.sub(r"\D", "", p)[-10:] for p in PHONE_RE.findall(text)))[:5]
@@ -259,15 +261,156 @@ async def analyze_text(text: str):
         if isinstance(r, dict) and r["verdict"] != "safe":
             lab = "Khatarnak" if r["verdict"] == "dangerous" else "Suspicious"
             add(findings, "danger" if r["verdict"] == "dangerous" else "warn",
-                f"Screenshot ka link {r['host']} scan kiya: {lab} (risk {r['score']}/100).", 40 if r["verdict"] == "dangerous" else 20)
+                f"Link {r['host']} scan kiya: {lab} (risk {r['score']}/100).", 40 if r["verdict"] == "dangerous" else 20)
         elif isinstance(r, dict):
-            add(findings, "ok", f"Screenshot ka link {r['host']} safe lag raha hai.")
-    if links: add(findings, "info", "Screenshot mein mile links: " + ", ".join(links[:5]), 0)
-    if upi: add(findings, "info", "UPI ID mili: " + ", ".join(upi) + ". Unknown UPI ID pe paisa mat bhejo.", 0)
-    if phones: add(findings, "info", "Phone number mile: " + ", ".join(phones) + ". Unknown number pe bharosa mat karo.", 0)
+            add(findings, "ok", f"Link {r['host']} safe lag raha hai.")
+    if links:
+        add(findings, "info", "Mile hue links: " + ", ".join(links[:5]), 0)
+    if upi:
+        add(findings, "info", "UPI ID mili: " + ", ".join(upi) + ". Unknown UPI ID pe paisa mat bhejo.", 0)
+    if phones:
+        add(findings, "info", "Phone number mile: " + ", ".join(phones) + ". Unknown number pe bharosa mat karo.", 0)
+    return findings
+
+
+async def analyze_text(text: str):
+    if len(text.strip()) < 10:
+        raise HTTPException(400, "Screenshot se text nahi nikla. Saaf aur bada screenshot try karo.")
+    findings = await text_findings(text[:5000])
     if not findings:
         add(findings, "ok", "Koi scam pattern nahi mila. Phir bhi paisa ya OTP dene se pehle sochna.")
     return finish("Screenshot scan", findings)
+
+
+# ---------- SMS ----------
+SENDER_RE = re.compile(r"^[A-Za-z]{2}-[A-Za-z0-9]{3,8}(?:-[A-Za-z])?$")
+
+
+async def analyze_sms(text: str, sender: str):
+    if len(text.strip()) < 5:
+        raise HTTPException(400, "SMS ka text paste karo.")
+    text, sender = text[:2000], sender.strip()[:40]
+    findings = await text_findings(text)
+    low = text.lower()
+    claims = any(b in low for b in BRANDS) or any(f["level"] == "danger" for f in findings)
+    if sender:
+        digits = re.sub(r"[\s-]", "", sender)
+        if SENDER_RE.match(sender):
+            add(findings, "info", f"Sender ID {sender} company wale format jaisa hai. Format asli ho sakta hai, par spoof bhi hota hai.", 0)
+        elif re.fullmatch(r"\+?(?:91)?0?[6-9]\d{9}", digits):
+            add(findings, "warn", "SMS normal mobile number se aaya hai. Banks aur companies apne official sender ID (jaise VM-HDFCBK) se SMS bhejti hain.", 20 if claims else 8)
+        elif digits.startswith("+") and not digits.startswith("+91"):
+            add(findings, "warn", "SMS international number se aaya hai.", 12)
+    if re.search(r"dear (?:customer|user|sir|madam|account holder|valued)", low):
+        add(findings, "warn", "Generic greeting (Dear customer). Asli bank aapka naam use karta hai.", 8)
+    if not findings:
+        add(findings, "ok", "Koi scam pattern nahi mila. Phir bhi link ya OTP ke liye sochna.")
+    return finish("SMS scan", findings)
+
+
+# ---------- Email ----------
+FREEMAIL = {"gmail.com", "yahoo.com", "yahoo.in", "outlook.com", "hotmail.com", "rediffmail.com",
+            "proton.me", "protonmail.com", "icloud.com"}
+BAD_EXT = {"exe", "scr", "bat", "cmd", "apk", "js", "vbs", "jar", "iso", "img", "lnk", "msi", "ps1"}
+RISKY_EXT = {"html", "htm", "zip", "rar", "7z", "docm", "xlsm", "pptm"}
+
+
+def parse_email(raw: str):
+    info = {"name": "", "addr": "", "reply": "", "auth": "", "subject": "", "text": "", "anchors": [], "files": [], "headers": False}
+    if not re.search(r"^(?:from|subject|received|return-path|message-id|authentication-results):", raw, re.I | re.M):
+        info["text"] = raw
+        return info
+    info["headers"] = True
+    msg = message_from_string(raw, policy=policy.default)
+    info["name"], info["addr"] = parseaddr(str(msg.get("From", "")))
+    info["reply"] = parseaddr(str(msg.get("Reply-To", "")))[1]
+    info["subject"] = str(msg.get("Subject", ""))
+    info["auth"] = " ".join(str(x) for x in (msg.get_all("Authentication-Results") or [])) + " " + str(msg.get("Received-SPF", ""))
+    texts = []
+    for part in msg.walk():
+        fn = part.get_filename()
+        if fn:
+            info["files"].append(str(fn))
+            continue
+        ct = part.get_content_type()
+        if ct in ("text/plain", "text/html"):
+            try:
+                s = part.get_content()
+            except Exception:
+                continue
+            if ct == "text/html":
+                for href, inner in re.findall(r"<a\s[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", s, re.I | re.S):
+                    info["anchors"].append((html_lib.unescape(re.sub(r"<[^>]+>", "", inner)).strip(), html_lib.unescape(href)))
+                s = re.sub(r"<(?:script|style).*?</(?:script|style)>", " ", s, flags=re.I | re.S)
+                s = html_lib.unescape(re.sub(r"<[^>]+>", " ", s))
+            texts.append(s)
+    info["text"] = "\n".join(texts)
+    return info
+
+
+async def analyze_email(raw: str):
+    if len(raw.strip()) < 20:
+        raise HTTPException(400, "Email paste karo (poora ya sirf body).")
+    try:
+        e = parse_email(raw[:200000])
+    except Exception:
+        e = {"name": "", "addr": "", "reply": "", "auth": "", "subject": "", "text": raw[:20000], "anchors": [], "files": [], "headers": False}
+    findings: list = []
+    dom = e["addr"].split("@")[-1].lower() if "@" in e["addr"] else ""
+    if not e["headers"]:
+        add(findings, "info", "Sirf email ki body paste hui hai, isliye sender aur headers check nahi hue. Poora email (Show original) paste karoge to zyada accurate hoga.", 0)
+    if dom:
+        reg = registered_domain(dom)
+        tmp: list = []
+        url_checks("https://" + dom, dom, reg, tmp)
+        for f in tmp:
+            if f["points"]:
+                add(findings, f["level"], "Sender domain: " + f["text"], f["points"])
+        try:
+            age: list = []
+            await domain_age(reg, age)
+            for f in age:
+                add(findings, f["level"], "Sender " + f["text"][0].lower() + f["text"][1:], f["points"])
+        except Exception:
+            pass
+        nm = e["name"].lower()
+        for b in BRANDS:
+            if b in nm and b not in dom:
+                add(findings, "danger", f"Sender ka naam '{e['name']}' hai par email {dom} se aaya hai.", 30)
+                break
+        else:
+            if dom in FREEMAIL and any(b in (nm + " " + e["subject"].lower()) for b in BRANDS):
+                add(findings, "warn", "Bank ya company ke naam ka email free email service se aaya hai. Asli companies apne domain se bhejti hain.", 20)
+        if e["reply"] and "@" in e["reply"] and registered_domain(e["reply"].split("@")[-1].lower()) != reg:
+            add(findings, "warn", f"Reply-To address ({e['reply']}) sender se alag domain ka hai. Jawab scammer ke paas jaayega.", 20)
+    auth = e["auth"].lower()
+    if re.search(r"\b(?:spf|dkim|dmarc)=(?:fail|softfail|none|permerror|temperror)", auth):
+        add(findings, "danger", "Email authentication fail hua (SPF/DKIM/DMARC). Ye email us domain se nahi aaya ho sakta jo dikh raha hai.", 25)
+    elif re.search(r"\b(?:spf|dkim|dmarc)=pass", auth):
+        add(findings, "ok", "SPF/DKIM/DMARC pass hua. Matlab email us domain se aaya, par domain asli hai ya nahi, ye alag dekhna padta hai.")
+    for fn in e["files"][:10]:
+        ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
+        if ext in BAD_EXT:
+            add(findings, "danger", f"Khatarnak attachment: {fn}. Ise kabhi open mat karo.", 30)
+        elif ext in RISKY_EXT:
+            add(findings, "warn", f"Risky attachment type: {fn}. Unknown sender ki aisi file mat kholo.", 20)
+    hrefs = []
+    for shown, href in e["anchors"]:
+        hh = urlparse(href).hostname
+        if href.lower().startswith("http") and href not in hrefs:
+            hrefs.append(href)
+        m = LINK_RE.search(shown)
+        if hh and m:
+            s = m.group(0)
+            sh = urlparse(s if s.lower().startswith("http") else "https://" + s).hostname
+            if sh and registered_domain(sh) != registered_domain(hh):
+                add(findings, "danger", f"Link ka dikhne wala text {sh} hai par asli destination {hh} hai. Ye phishing ki trick hai.", 35)
+                break
+    body = (e["subject"] + "\n" + e["text"])[:8000]
+    findings += await text_findings(body, hrefs[:3])
+    if not any(f["points"] for f in findings) and not any(f["level"] == "ok" for f in findings):
+        add(findings, "ok", "Koi scam pattern nahi mila. Phir bhi link ya attachment kholne se pehle sochna.")
+    return finish(dom or "Email scan", findings)
 
 
 # ---------- Phase 3: APK analysis (file stays in the browser; only metadata comes here) ----------
@@ -350,6 +493,10 @@ async def analyze_apk(a: dict):
 async def scan(body: Req):
     if body.kind == "text":
         return await analyze_text(body.text)
+    if body.kind == "sms":
+        return await analyze_sms(body.text, body.sender)
+    if body.kind == "email":
+        return await analyze_email(body.text)
     if body.kind == "apk":
         return await analyze_apk(body.apk or {})
     return await analyze_url(body.url)
@@ -367,98 +514,129 @@ PAGE = r'''<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
 @property --p{syntax:'<number>';inherits:false;initial-value:0}
-:root{--bg:#12111c;--s1:#1b1a2b;--s2:#232238;--line:#34324d;--text:#efecfb;--muted:#9d99ba;
---accent:#b3a6ff;--safe:#4fd1a1;--warn:#f3b34f;--danger:#ff6b64;--c:var(--accent)}
+:root{--bg:#0f0e19;--s1:#1a1929;--s2:#232238;--line:#3a3857;--text:#f1eefc;--muted:#a09cbd;
+--accent:#b3a6ff;--deep:#6d5cff;--pink:#ff7ab6;--safe:#4fd1a1;--warn:#f3b34f;--danger:#ff6b64;--c:var(--accent)}
 *{box-sizing:border-box}[hidden]{display:none!important}
 html{background:var(--bg)}
-body{margin:0;color:var(--text);font:16px/1.65 Hind,system-ui,sans-serif;min-height:100vh;
-background:radial-gradient(900px 420px at 85% -80px,rgba(143,125,255,.20),transparent 70%),var(--bg)}
-main{max-width:760px;margin:0 auto;padding:28px 20px 90px}
+body{margin:0;color:var(--text);font:16px/1.65 Hind,system-ui,sans-serif;min-height:100vh;overflow-x:hidden;
+background:radial-gradient(900px 460px at 88% -90px,rgba(109,92,255,.32),transparent 70%),radial-gradient(600px 400px at -10% 30%,rgba(255,122,182,.10),transparent 70%),var(--bg)}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;
+background-image:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px);
+background-size:52px 52px;-webkit-mask-image:radial-gradient(ellipse at 50% 0,#000,transparent 75%);mask-image:radial-gradient(ellipse at 50% 0,#000,transparent 75%)}
+main{position:relative;max-width:780px;margin:0 auto;padding:26px 20px 90px}
 .top{display:flex;align-items:center;justify-content:space-between}
 .brand{display:flex;align-items:center;gap:10px;font:800 22px Sora,sans-serif;letter-spacing:-.5px}
-.brand b{color:var(--accent)}
-.mark{width:34px;height:34px}
-.beta{font-size:13px;color:var(--muted);border:1px solid var(--line);padding:2px 10px;border-radius:999px}
-.hero{position:relative;padding:56px 0 34px;overflow:hidden}
-.ghost{position:absolute;right:-6px;top:6px;font:800 260px/1 Sora,sans-serif;color:transparent;
--webkit-text-stroke:2px rgba(179,166,255,.22);text-shadow:18px 18px 0 rgba(179,166,255,.07);user-select:none;pointer-events:none}
-h1{position:relative;font:800 clamp(34px,7vw,56px)/1.06 Sora,sans-serif;letter-spacing:-1.5px;margin:0 0 14px;max-width:13ch}
+.brand b{color:var(--accent)}.mark{width:36px;height:36px}
+.beta{font-size:13px;color:var(--muted);border:1.5px solid var(--line);padding:2px 12px;border-radius:999px}
+
+.hero{position:relative;padding:54px 0 26px}
+.ghost{position:absolute;right:-8px;top:0;font:800 270px/1 Sora,sans-serif;color:transparent;-webkit-text-stroke:2px rgba(179,166,255,.26);
+text-shadow:20px 20px 0 rgba(255,122,182,.08);user-select:none;pointer-events:none;transition:transform .8s cubic-bezier(.2,.9,.2,1)}
+h1{position:relative;font:800 clamp(38px,8vw,64px)/1.02 Sora,sans-serif;letter-spacing:-2px;margin:0 0 16px;max-width:12ch;text-shadow:4px 4px 0 rgba(109,92,255,.45)}
 .sub{position:relative;color:var(--muted);margin:0;max-width:46ch;font-size:17px}
+.rise{animation:rise .8s cubic-bezier(.2,.8,.2,1) both}
+@keyframes rise{from{opacity:0;transform:translateY(18px)}}
 
-.panel{position:relative;background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:18px;
-box-shadow:0 40px 70px -40px rgba(0,0,0,.8);overflow:hidden}
-.panel.busy::before{content:"";position:absolute;left:0;top:0;height:3px;width:40%;background:linear-gradient(90deg,transparent,var(--accent),transparent);
-animation:sweep 1.1s linear infinite}
+.marq{overflow:hidden;margin:6px -20px 26px;border-block:1.5px solid var(--line);padding:9px 0;background:rgba(255,255,255,.02);
+-webkit-mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent);mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,transparent)}
+.marq div{display:flex;gap:30px;width:max-content;animation:marq 34s linear infinite;color:var(--muted);font:600 14px Sora,sans-serif;white-space:nowrap}
+.marq:hover div{animation-play-state:paused}
+.marq i{font-style:normal;color:var(--pink)}
+@keyframes marq{to{transform:translateX(-50%)}}
+
+.panel{position:relative;border:1.5px solid transparent;border-radius:24px;padding:18px;overflow:hidden;
+background:linear-gradient(var(--s1),var(--s1)) padding-box,linear-gradient(135deg,var(--accent),var(--line) 45%,var(--pink)) border-box;
+box-shadow:0 40px 80px -40px rgba(0,0,0,.9),10px 10px 0 -2px rgba(109,92,255,.28)}
+.panel.busy::before{content:"";position:absolute;left:0;top:0;height:3px;width:40%;background:linear-gradient(90deg,transparent,var(--pink),var(--accent),transparent);animation:sweep 1s linear infinite;z-index:2}
 @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(260%)}}
-.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:var(--s2);padding:4px;border-radius:14px}
-.tab{display:flex;align-items:center;justify-content:center;gap:8px;background:none;border:0;color:var(--muted);
-padding:11px 8px;border-radius:10px;font:500 15px Hind,sans-serif;cursor:pointer;transition:background .2s,color .2s}
-.tab svg{width:18px;height:18px;flex:none}
-.tab:hover{color:var(--text)}
-.tab.on{background:var(--accent);color:#17142a;font-weight:600}
-.hint{color:var(--muted);font-size:15px;margin:14px 2px 14px}
-form{display:flex;gap:10px;flex-wrap:wrap}
-input[type=text]{flex:1 1 260px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:15px 16px;border-radius:13px;font:17px Hind,sans-serif}
-input[type=text]::placeholder{color:#6d6a8a}
-input:focus,button:focus-visible,.drop:focus-within{outline:2px solid var(--accent);outline-offset:2px}
-button.go{background:var(--accent);color:#17142a;border:0;padding:15px 26px;border-radius:13px;font:700 16px Sora,sans-serif;cursor:pointer}
-button.go:hover{filter:brightness(1.08)}button.go:disabled{opacity:.6;cursor:wait}
-.try{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;color:var(--muted);font-size:14px}
-.chip{background:var(--s2);border:1px solid var(--line);color:var(--text);padding:4px 12px;border-radius:999px;font:14px Hind,sans-serif;cursor:pointer}
-.chip:hover{border-color:var(--accent)}
-.drop{display:flex;flex-direction:column;align-items:center;gap:6px;border:2px dashed var(--line);border-radius:16px;padding:34px 18px;text-align:center;cursor:pointer;background:var(--bg);transition:border-color .2s,background .2s}
-.drop:hover,.drop.over{border-color:var(--accent);background:var(--s2)}
-.drop input{position:absolute;opacity:0;width:1px;height:1px}
-.drop svg{width:34px;height:34px;color:var(--accent)}
-.drop strong{font:600 17px Sora,sans-serif}.drop span{color:var(--muted);font-size:14px}
-.status{color:var(--accent);margin:12px 2px 0;min-height:0}.status:empty{display:none}
+.tabs{position:relative;display:flex;gap:2px;background:var(--bg);padding:4px;border-radius:15px;border:1.5px solid var(--line)}
+.pill{position:absolute;left:0;top:4px;bottom:4px;width:0;border-radius:11px;background:linear-gradient(135deg,var(--accent),#9d8dff);
+box-shadow:3px 3px 0 var(--deep);transition:transform .45s cubic-bezier(.3,1.35,.5,1),width .45s cubic-bezier(.3,1.35,.5,1)}
+.tab{position:relative;flex:1;display:flex;align-items:center;justify-content:center;gap:7px;background:none;border:0;color:var(--muted);
+padding:11px 4px;border-radius:11px;font:600 14px Hind,sans-serif;cursor:pointer;transition:color .25s;white-space:nowrap}
+.tab svg{width:17px;height:17px;flex:none}.tab:hover{color:var(--text)}.tab.on{color:#17142a}
+.hint{color:var(--muted);font-size:15px;margin:16px 2px 14px;min-height:26px}
+.enter{animation:paneIn .42s cubic-bezier(.2,.8,.2,1) both}
+@keyframes paneIn{from{opacity:0;transform:translateY(14px) scale(.985);filter:blur(4px)}}
 
-#out{margin-top:28px}
-.card{--c:var(--accent);background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:24px;
-box-shadow:12px 12px 0 -1px color-mix(in srgb,var(--c) 20%,transparent)}
-.res{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
-.ring{width:128px;height:128px;border-radius:50%;flex:none;display:grid;place-items:center;
-background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);animation:fill 1s cubic-bezier(.2,.8,.2,1)}
+form{display:flex;gap:10px;flex-wrap:wrap}
+input[type=text],textarea{width:100%;background:var(--bg);border:1.5px solid var(--line);color:var(--text);padding:15px 16px;border-radius:14px;font:17px Hind,sans-serif;transition:border-color .2s}
+form input[type=text]{flex:1 1 260px;width:auto}
+textarea{resize:vertical;min-height:130px;margin-top:10px;display:block}
+input[type=text]::placeholder,textarea::placeholder{color:#6f6c8d}
+input:focus,textarea:focus{border-color:var(--accent)}
+input:focus-visible,textarea:focus-visible,button:focus-visible,.drop:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+button.go{background:var(--accent);color:#17142a;border:0;padding:15px 28px;border-radius:14px;font:800 16px Sora,sans-serif;cursor:pointer;
+box-shadow:4px 4px 0 var(--deep);transition:transform .12s,box-shadow .12s}
+button.go:hover{transform:translate(-1px,-1px);box-shadow:6px 6px 0 var(--deep)}
+button.go:active{transform:translate(4px,4px);box-shadow:0 0 0 var(--deep)}
+button.go:disabled{opacity:.6;cursor:wait}.full{margin-top:12px;width:100%}
+.try{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;color:var(--muted);font-size:14px}
+.chip{background:var(--s2);border:1.5px solid var(--line);color:var(--text);padding:4px 13px;border-radius:999px;font:14px Hind,sans-serif;cursor:pointer;transition:border-color .2s,transform .2s}
+.chip:hover{border-color:var(--pink);transform:translateY(-2px)}
+.how{color:var(--muted);font-size:14px;margin:10px 2px 0}
+.drop{display:flex;flex-direction:column;align-items:center;gap:6px;border:2px dashed var(--line);border-radius:18px;padding:36px 18px;text-align:center;cursor:pointer;background:var(--bg);transition:border-color .2s,background .2s,transform .2s}
+.drop:hover,.drop.over{border-color:var(--pink);background:var(--s2);transform:translateY(-2px)}
+.drop input{position:absolute;opacity:0;width:1px;height:1px}
+.drop svg{width:36px;height:36px;color:var(--accent)}
+.drop strong{font:700 17px Sora,sans-serif}.drop span{color:var(--muted);font-size:14px}
+.status{color:var(--accent);margin:12px 2px 0}.status:empty{display:none}
+
+#out{margin-top:30px}
+.card{--c:var(--accent);background:var(--s1);border:1.5px solid var(--line);border-radius:24px;padding:26px;
+box-shadow:14px 14px 0 -1px color-mix(in srgb,var(--c) 26%,transparent);animation:rise .6s cubic-bezier(.2,.8,.2,1) both}
+.res{display:flex;gap:28px;align-items:center;flex-wrap:wrap}
+.ring{width:136px;height:136px;border-radius:50%;flex:none;display:grid;place-items:center;background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);animation:fill 1.1s cubic-bezier(.2,.8,.2,1)}
 @keyframes fill{from{--p:0}}
-.ring span{width:100px;height:100px;border-radius:50%;background:var(--s1);display:grid;place-items:center;font:800 34px Sora,sans-serif}
-.verdict{font:800 28px/1.15 Sora,sans-serif;color:var(--c);letter-spacing:-.5px}
-.host{color:var(--muted);word-break:break-all;font-size:15px}
+.ring span{width:106px;height:106px;border-radius:50%;background:var(--s1);display:grid;place-items:center;font:800 36px Sora,sans-serif}
+.verdict{font:800 30px/1.1 Sora,sans-serif;color:var(--c);letter-spacing:-.8px}
+.host{color:var(--muted);word-break:break-all;font-size:15px;margin-top:2px}
 .advice{margin:10px 0 0;max-width:44ch}
-.list{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:8px}
-.list li{display:flex;gap:12px;align-items:flex-start;background:var(--s1);border:1px solid var(--line);padding:13px 14px;border-radius:14px;word-break:break-word}
-.ic{flex:none;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font:800 13px Sora,sans-serif;color:#17142a;background:var(--accent);margin-top:1px}
-.list li.danger .ic{background:var(--danger)}.list li.warn .ic{background:var(--warn)}.list li.ok .ic{background:var(--safe)}
+.list{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:9px}
+.list li{display:flex;gap:12px;align-items:flex-start;background:var(--s1);border:1.5px solid var(--line);padding:13px 14px;border-radius:15px;word-break:break-word;animation:rise .5s cubic-bezier(.2,.8,.2,1) both}
+.ic{flex:none;width:25px;height:25px;border-radius:50%;display:grid;place-items:center;font:800 13px Sora,sans-serif;color:#17142a;background:var(--accent);margin-top:1px}
+.list li.danger{border-color:rgba(255,107,100,.5)}.list li.danger .ic{background:var(--danger)}
+.list li.warn{border-color:rgba(243,179,79,.45)}.list li.warn .ic{background:var(--warn)}
+.list li.ok .ic{background:var(--safe)}
 .list li.info{background:transparent;border-style:dashed;color:var(--muted)}
 .note{color:var(--muted);font-size:14px;margin:22px 2px 0}
-.report{display:inline-block;margin-top:12px;color:var(--text);border:1px solid var(--line);padding:9px 14px;border-radius:12px;text-decoration:none;font-weight:500}
-.report:hover{border-color:var(--accent)}
-.err{color:var(--danger);background:var(--s1);border:1px solid var(--danger);padding:12px 14px;border-radius:14px}
-footer{margin-top:40px;color:var(--muted);font-size:13px;text-align:center}
-@media(max-width:520px){.ghost{font-size:180px}.tab span{font-size:14px}.tab svg{display:none}}
+.report{display:inline-block;margin-top:12px;color:var(--text);border:1.5px solid var(--line);padding:10px 16px;border-radius:13px;text-decoration:none;font-weight:600;transition:border-color .2s,transform .2s}
+.report:hover{border-color:var(--pink);transform:translateY(-2px)}
+.err{color:var(--danger);background:var(--s1);border:1.5px solid var(--danger);padding:12px 14px;border-radius:14px}
+footer{margin-top:44px;color:var(--muted);font-size:13px;text-align:center}
+@media(max-width:640px){.ghost{font-size:170px}.tab svg{display:none}.tab{font-size:13px;padding:11px 2px}.panel{padding:14px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <main>
-  <header class="top">
+  <header class="top rise">
     <div class="brand">
-      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#b3a6ff"/><path d="M11 11l11 11M22 11L11 22" stroke="#17142a" stroke-opacity=".28" stroke-width="4" stroke-linecap="round" transform="translate(1.8 1.8)"/><path d="M10 10l11 11M21 10L10 21" stroke="#17142a" stroke-width="4" stroke-linecap="round"/></svg>
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#b3a6ff"/><path d="M11 11l11 11M22 11L11 22" stroke="#6d5cff" stroke-width="4" stroke-linecap="round" transform="translate(2 2)"/><path d="M10 10l11 11M21 10L10 21" stroke="#17142a" stroke-width="4" stroke-linecap="round"/></svg>
       <span>Shadow<b>X</b></span>
     </div>
     <span class="beta">Beta</span>
   </header>
 
   <section class="hero">
-    <div class="ghost" aria-hidden="true">X</div>
-    <h1>Bharosa karne se pehle scan karo.</h1>
-    <p class="sub">Link, screenshot ya APK file daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
+    <div class="ghost" id="ghost" aria-hidden="true">X</div>
+    <h1 class="rise" style="animation-delay:.1s">Bharosa karne se pehle scan karo.</h1>
+    <p class="sub rise" style="animation-delay:.25s">Link, screenshot, APK, SMS ya email daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
   </section>
 
-  <section class="panel" id="panel">
-    <div class="tabs" role="tablist">
+  <div class="marq rise" style="animation-delay:.35s" aria-hidden="true"><div>
+    <span>KYC update scam</span><i>x</i><span>Digital arrest</span><i>x</i><span>Fake lottery</span><i>x</i><span>Job offer fraud</span><i>x</i><span>Bijli bill dhamki</span><i>x</i><span>Fake APK</span><i>x</i><span>UPI collect request</span><i>x</i><span>Phishing link</span><i>x</i>
+    <span>KYC update scam</span><i>x</i><span>Digital arrest</span><i>x</i><span>Fake lottery</span><i>x</i><span>Job offer fraud</span><i>x</i><span>Bijli bill dhamki</span><i>x</i><span>Fake APK</span><i>x</i><span>UPI collect request</span><i>x</i><span>Phishing link</span><i>x</i>
+  </div></div>
+
+  <section class="panel rise" id="panel" style="animation-delay:.45s">
+    <div class="tabs" id="tabs" role="tablist">
+      <span class="pill" id="pill"></span>
       <button class="tab on" type="button" data-t="url"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Link</span></button>
       <button class="tab" type="button" data-t="shot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 9"/></svg><span>Screenshot</span></button>
-      <button class="tab" type="button" data-t="apk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg><span>APK file</span></button>
+      <button class="tab" type="button" data-t="apk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg><span>APK</span></button>
+      <button class="tab" type="button" data-t="sms"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.5 7.200L4 21l1.800-5A8 8 0 1 1 21 12z"/><path d="M8.500 11h7M8.500 14h4"/></svg><span>SMS</span></button>
+      <button class="tab" type="button" data-t="mail"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M4 7l8 6 8-6"/></svg><span>Email</span></button>
     </div>
     <p class="hint" id="hint"></p>
 
@@ -488,6 +666,20 @@ footer{margin-top:40px;color:var(--muted);font-size:13px;text-align:center}
       </label>
     </div>
 
+    <div id="p-sms" hidden>
+      <input id="sms-from" type="text" placeholder="Sender (optional): jaise VM-HDFCBK ya +919876543210" autocomplete="off">
+      <textarea id="sms-text" placeholder="Jo SMS aaya hai wo yahan paste karo"></textarea>
+      <button class="go full" id="sms-go" type="button">SMS scan karo</button>
+      <div class="try">Try karo: <button type="button" class="chip" id="sms-ex">Fake KYC SMS</button></div>
+    </div>
+
+    <div id="p-mail" hidden>
+      <textarea id="mail-text" placeholder="Email yahan paste karo (poora ya sirf body)" style="min-height:170px;margin-top:0"></textarea>
+      <p class="how">Gmail mein email kholo, upar teen dots dabao, <b>Show original</b> chuno, <b>Copy to clipboard</b> karo aur yahan paste karo. Isse sender aur authentication bhi check hota hai. Sirf body bhi chalegi.</p>
+      <button class="go full" id="mail-go" type="button">Email scan karo</button>
+      <div class="try">Try karo: <button type="button" class="chip" id="mail-ex">Fake bank email</button></div>
+    </div>
+
     <p class="status" id="st" aria-live="polite"></p>
   </section>
 
@@ -497,6 +689,7 @@ footer{margin-top:40px;color:var(--muted);font-size:13px;text-align:center}
 
 <script>
 const $ = id => document.getElementById(id), out = $('out'), st = $('st'), panel = $('panel');
+const TABS = ['url','shot','apk','sms','mail'];
 const LABEL = {safe:'Safe lag raha hai', suspicious:'Suspicious hai', dangerous:'Khatarnak hai'};
 const COLOR = {safe:'var(--safe)', suspicious:'var(--warn)', dangerous:'var(--danger)'};
 const ADVICE = {
@@ -507,18 +700,30 @@ const ICON = {danger:'!', warn:'!', ok:'\u2713', info:'i'};
 const HINT = {
   url:'Koi bhi link paste karo. Domain, SSL aur page check honge.',
   shot:'Scam SMS ya chat ka screenshot daalo. Text padh ke scam pattern pakda jaayega.',
-  apk:'APK file chuno. Permissions aur andar ke links check honge.'};
+  apk:'APK file chuno. Permissions aur andar ke links check honge.',
+  sms:'SMS ka text paste karo, sender bhi daal sakte ho. Fake bank aur KYC SMS pakde jaayenge.',
+  mail:'Email paste karo. Sender, fake links, attachments aur authentication check honge.'};
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 function el(tag, cls, text){ const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
 function busy(on, msg){ panel.classList.toggle('busy', on); st.textContent = on ? (msg || '') : ''; }
+function replay(node){ node.classList.remove('enter'); void node.offsetWidth; node.classList.add('enter'); }
 
+function movePill(){
+  const b = document.querySelector('.tab.on'), p = $('pill');
+  if (!b) return; p.style.width = b.offsetWidth + 'px'; p.style.transform = 'translateX(' + b.offsetLeft + 'px)';
+}
 function setTab(t){
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
-  ['url','shot','apk'].forEach(k => $('p-' + k).hidden = (k !== t));
-  $('hint').textContent = HINT[t]; out.textContent = ''; busy(false);
+  TABS.forEach(k => { $('p-' + k).hidden = (k !== t); });
+  replay($('p-' + t)); $('hint').textContent = HINT[t]; replay($('hint'));
+  const i = TABS.indexOf(t);
+  $('ghost').style.transform = 'translateX(' + (i * -22) + 'px) rotate(' + (i * -4) + 'deg)';
+  movePill(); out.textContent = ''; busy(false);
 }
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.t)));
 setTab('url');
+addEventListener('resize', movePill);
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(movePill);
 
 async function call(payload){
   const r = await fetch('/api/index', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -527,15 +732,24 @@ async function call(payload){
   return d;
 }
 function fail(e){ out.textContent = ''; out.append(el('p', 'err', e.message)); }
-
-// ---- link scan
-async function doUrl(v){
-  const btn = $('b'); btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = ''; busy(true);
-  try { render(await call({kind:'url', url:v})); } catch (err) { fail(err); }
-  btn.disabled = false; btn.textContent = 'Scan karo'; busy(false);
+async function run(btn, label, payload){
+  btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = ''; busy(true, 'Check ho raha hai...');
+  try { render(await call(payload)); } catch (err) { fail(err); }
+  btn.disabled = false; btn.textContent = label; busy(false);
 }
-$('f').addEventListener('submit', e => { e.preventDefault(); doUrl($('u').value); });
-document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { $('u').value = c.dataset.u; doUrl(c.dataset.u); }));
+
+// ---- link / sms / email
+$('f').addEventListener('submit', e => { e.preventDefault(); run($('b'), 'Scan karo', {kind:'url', url:$('u').value}); });
+document.querySelectorAll('.chip[data-u]').forEach(c => c.addEventListener('click', () => { $('u').value = c.dataset.u; run($('b'), 'Scan karo', {kind:'url', url:c.dataset.u}); }));
+$('sms-go').addEventListener('click', () => run($('sms-go'), 'SMS scan karo', {kind:'sms', text:$('sms-text').value, sender:$('sms-from').value}));
+$('mail-go').addEventListener('click', () => run($('mail-go'), 'Email scan karo', {kind:'email', text:$('mail-text').value}));
+$('sms-ex').addEventListener('click', () => {
+  $('sms-from').value = '+919876543210';
+  $('sms-text').value = 'Dear customer, your SBI account will be blocked today. Update KYC immediately: http://sbi-kyc-update.xyz/login';
+});
+$('mail-ex').addEventListener('click', () => {
+  $('mail-text').value = 'From: "SBI Bank Alerts" <alerts@sbi-secure-login.xyz>\nReply-To: helpdesk@gmail.com\nSubject: Urgent: your account will be suspended\nAuthentication-Results: mx.google.com; spf=fail smtp.mailfrom=sbi-secure-login.xyz; dkim=none\nContent-Type: text/plain; charset=utf-8\n\nDear customer, your KYC has expired. Verify your account within 24 hours or it will be blocked.\nClick here: http://sbi-secure-login.xyz/verify';
+});
 
 // ---- screenshot scan (OCR runs in the browser)
 async function doShot(file){
@@ -620,7 +834,6 @@ async function doApk(file){
 }
 $('fa').addEventListener('change', e => { doApk(e.target.files[0]); e.target.value = ''; });
 
-// drag and drop
 [['d-shot', doShot], ['d-apk', doApk]].forEach(([id, fn]) => {
   const z = $(id);
   z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
@@ -632,7 +845,7 @@ $('fa').addEventListener('change', e => { doApk(e.target.files[0]); e.target.val
 function countUp(node, to){
   if (reduce || !to){ node.textContent = to; return; }
   const t0 = performance.now();
-  (function tick(t){ const k = Math.min(1, (t - t0) / 900); node.textContent = Math.round(to * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(tick); })(t0);
+  (function tick(t){ const k = Math.min(1, (t - t0) / 1000); node.textContent = Math.round(to * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(tick); })(t0);
 }
 function render(d){
   out.textContent = '';
@@ -645,8 +858,10 @@ function render(d){
   res.append(ring, info); card.append(res);
 
   const ul = el('ul', 'list');
-  d.findings.forEach(f => { const li = el('li', f.level); li.append(el('span', 'ic', ICON[f.level] || 'i'), el('span', null, f.text)); ul.append(li); });
-
+  d.findings.forEach((f, i) => {
+    const li = el('li', f.level); li.style.animationDelay = (0.25 + i * 0.07) + 's';
+    li.append(el('span', 'ic', ICON[f.level] || 'i'), el('span', null, f.text)); ul.append(li);
+  });
   const keys = [];
   if (!d.apis.virustotal) keys.push('VirusTotal');
   if (!d.apis.safe_browsing) keys.push('Google Safe Browsing');
