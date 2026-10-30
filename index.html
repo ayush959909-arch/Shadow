@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowX - Scam aur fraud scanner</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🕶️</text></svg>">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;800&family=Hind:wght@400;500&display=swap">
+<style>
+:root{--bg:#14131f;--panel:#1e1c2e;--line:#322f4a;--text:#ebe8f7;--muted:#9c98b8;--accent:#aa9dff;
+--safe:#5bd1a5;--warn:#f2b14c;--danger:#f0645e;--c:var(--accent)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 Hind,system-ui,sans-serif}
+main{max-width:720px;margin:0 auto;padding:48px 20px 80px}
+.brand{font:800 22px Sora,sans-serif;letter-spacing:-.5px}
+.brand b{color:var(--accent)}
+h1{font:800 clamp(30px,6vw,46px)/1.12 Sora,sans-serif;letter-spacing:-1px;margin:40px 0 12px;max-width:16ch}
+.sub{color:var(--muted);margin:0 0 28px;max-width:50ch}
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.tab{background:none;border:1px solid var(--line);color:var(--muted);padding:8px 14px;border-radius:999px;font:inherit;cursor:not-allowed}
+.tab.on{background:var(--accent);border-color:var(--accent);color:#14131f;font-weight:500;cursor:default}
+.tab small{opacity:.7;margin-left:4px}
+form{display:flex;gap:8px;flex-wrap:wrap}
+input{flex:1 1 280px;background:var(--panel);border:1px solid var(--line);color:var(--text);padding:14px 16px;border-radius:12px;font:inherit}
+input:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.go{background:var(--accent);color:#14131f;border:0;padding:14px 22px;border-radius:12px;font:600 16px Sora,sans-serif;cursor:pointer}
+button.go:disabled{opacity:.6;cursor:wait}
+#out{margin-top:36px}
+.res{display:flex;gap:24px;align-items:center;flex-wrap:wrap}
+.ring{--c:var(--accent);width:132px;height:132px;border-radius:50%;flex:none;display:grid;place-items:center;
+background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);box-shadow:14px 14px 0 -2px color-mix(in srgb,var(--c) 22%,transparent)}
+.ring span{width:104px;height:104px;border-radius:50%;background:var(--bg);display:grid;place-items:center;font:800 34px Sora,sans-serif}
+.verdict{font:800 28px Sora,sans-serif;color:var(--c)}
+.host{color:var(--muted);word-break:break-all}
+ul{list-style:none;padding:0;margin:28px 0 0;display:grid;gap:8px}
+li{background:var(--panel);border-left:4px solid var(--line);padding:12px 14px;border-radius:8px}
+li.danger{border-color:var(--danger)}li.warn{border-color:var(--warn)}li.ok{border-color:var(--safe)}
+.note{color:var(--muted);font-size:14px;margin-top:24px}
+.note a{color:var(--accent)}
+.err{color:var(--danger)}
+@media(prefers-reduced-motion:no-preference){.ring{transition:background .6s}}
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">Shadow<b>X</b></div>
+  <h1>Bharosa karne se pehle scan karo.</h1>
+  <p class="sub">Koi bhi link daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
+
+  <div class="tabs">
+    <button class="tab on" type="button">Website / Link</button>
+    <button class="tab" type="button" disabled>Screenshot <small>Phase 2</small></button>
+    <button class="tab" type="button" disabled>APK file <small>Phase 3</small></button>
+  </div>
+
+  <form id="f">
+    <input id="u" type="text" placeholder="Link paste karo, jaise sbi-login-secure.xyz" autocomplete="off" required>
+    <button class="go" id="b">Scan karo</button>
+  </form>
+
+  <section id="out" aria-live="polite"></section>
+</main>
+
+<script>
+const out = document.getElementById('out'), btn = document.getElementById('b');
+const LABEL = {safe:'Safe lag raha hai', suspicious:'Suspicious hai', dangerous:'Khatarnak hai'};
+const COLOR = {safe:'var(--safe)', suspicious:'var(--warn)', dangerous:'var(--danger)'};
+
+document.getElementById('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = '';
+  try {
+    const r = await fetch('/api/index', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url: document.getElementById('u').value})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Scan fail ho gaya.');
+    render(d);
+  } catch (err) {
+    const p = document.createElement('p'); p.className = 'err'; p.textContent = err.message; out.append(p);
+  }
+  btn.disabled = false; btn.textContent = 'Scan karo';
+});
+
+function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+
+function render(d) {
+  const res = el('div', 'res'), ring = el('div', 'ring');
+  ring.style.setProperty('--p', d.score); ring.style.setProperty('--c', COLOR[d.verdict]);
+  ring.append(el('span', null, d.score));
+  const info = el('div'); info.style.setProperty('--c', COLOR[d.verdict]);
+  info.append(el('div', 'verdict', LABEL[d.verdict]), el('div', 'host', d.host), el('div', 'host', 'Risk score: ' + d.score + '/100'));
+  res.append(ring, info);
+
+  const ul = el('ul');
+  d.findings.forEach(f => ul.append(el('li', f.level, f.text)));
+  if (!d.findings.length) ul.append(el('li', 'ok', 'Koi red flag nahi mila.'));
+
+  const keys = [];
+  if (!d.apis.virustotal) keys.push('VirusTotal');
+  if (!d.apis.safe_browsing) keys.push('Google Safe Browsing');
+  const note = el('p', 'note', 'Koi bhi scanner 100% pakka nahi hota. Shak ho to paise ya OTP mat do. ');
+  if (keys.length) note.append(keys.join(' aur ') + ' ki API key abhi set nahi hai, isliye wo check skip hue. ');
+  const a = el('a', null, 'Scam hua? cybercrime.gov.in ya 1930 pe report karo.');
+  a.href = 'https://cybercrime.gov.in'; a.target = '_blank'; a.rel = 'noopener';
+  note.append(a);
+  out.append(res, ul, note);
+}
+</script>
+</body>
+</html>
