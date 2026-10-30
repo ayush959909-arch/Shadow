@@ -362,96 +362,163 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ShadowX - Scam aur fraud scanner</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🕶️</text></svg>">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;800&family=Hind:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;800&family=Hind:wght@400;500;600&display=swap">
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
-:root{--bg:#14131f;--panel:#1e1c2e;--line:#322f4a;--text:#ebe8f7;--muted:#9c98b8;--accent:#aa9dff;
---safe:#5bd1a5;--warn:#f2b14c;--danger:#f0645e;--c:var(--accent)}
+@property --p{syntax:'<number>';inherits:false;initial-value:0}
+:root{--bg:#12111c;--s1:#1b1a2b;--s2:#232238;--line:#34324d;--text:#efecfb;--muted:#9d99ba;
+--accent:#b3a6ff;--safe:#4fd1a1;--warn:#f3b34f;--danger:#ff6b64;--c:var(--accent)}
 *{box-sizing:border-box}[hidden]{display:none!important}
-body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 Hind,system-ui,sans-serif}
-main{max-width:720px;margin:0 auto;padding:48px 20px 80px}
-.brand{font:800 22px Sora,sans-serif;letter-spacing:-.5px}.brand b{color:var(--accent)}
-h1{font:800 clamp(30px,6vw,46px)/1.12 Sora,sans-serif;letter-spacing:-1px;margin:40px 0 12px;max-width:16ch}
-.sub{color:var(--muted);margin:0 0 28px;max-width:50ch}
-.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
-.tab{background:none;border:1px solid var(--line);color:var(--muted);padding:8px 14px;border-radius:999px;font:inherit;cursor:pointer}
-.tab.on{background:var(--accent);border-color:var(--accent);color:#14131f;font-weight:500}
-form{display:flex;gap:8px;flex-wrap:wrap}
-input[type=text]{flex:1 1 280px;background:var(--panel);border:1px solid var(--line);color:var(--text);padding:14px 16px;border-radius:12px;font:inherit}
+html{background:var(--bg)}
+body{margin:0;color:var(--text);font:16px/1.65 Hind,system-ui,sans-serif;min-height:100vh;
+background:radial-gradient(900px 420px at 85% -80px,rgba(143,125,255,.20),transparent 70%),var(--bg)}
+main{max-width:760px;margin:0 auto;padding:28px 20px 90px}
+.top{display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:10px;font:800 22px Sora,sans-serif;letter-spacing:-.5px}
+.brand b{color:var(--accent)}
+.mark{width:34px;height:34px}
+.beta{font-size:13px;color:var(--muted);border:1px solid var(--line);padding:2px 10px;border-radius:999px}
+.hero{position:relative;padding:56px 0 34px;overflow:hidden}
+.ghost{position:absolute;right:-6px;top:6px;font:800 260px/1 Sora,sans-serif;color:transparent;
+-webkit-text-stroke:2px rgba(179,166,255,.22);text-shadow:18px 18px 0 rgba(179,166,255,.07);user-select:none;pointer-events:none}
+h1{position:relative;font:800 clamp(34px,7vw,56px)/1.06 Sora,sans-serif;letter-spacing:-1.5px;margin:0 0 14px;max-width:13ch}
+.sub{position:relative;color:var(--muted);margin:0;max-width:46ch;font-size:17px}
+
+.panel{position:relative;background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:18px;
+box-shadow:0 40px 70px -40px rgba(0,0,0,.8);overflow:hidden}
+.panel.busy::before{content:"";position:absolute;left:0;top:0;height:3px;width:40%;background:linear-gradient(90deg,transparent,var(--accent),transparent);
+animation:sweep 1.1s linear infinite}
+@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(260%)}}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:var(--s2);padding:4px;border-radius:14px}
+.tab{display:flex;align-items:center;justify-content:center;gap:8px;background:none;border:0;color:var(--muted);
+padding:11px 8px;border-radius:10px;font:500 15px Hind,sans-serif;cursor:pointer;transition:background .2s,color .2s}
+.tab svg{width:18px;height:18px;flex:none}
+.tab:hover{color:var(--text)}
+.tab.on{background:var(--accent);color:#17142a;font-weight:600}
+.hint{color:var(--muted);font-size:15px;margin:14px 2px 14px}
+form{display:flex;gap:10px;flex-wrap:wrap}
+input[type=text]{flex:1 1 260px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:15px 16px;border-radius:13px;font:17px Hind,sans-serif}
+input[type=text]::placeholder{color:#6d6a8a}
 input:focus,button:focus-visible,.drop:focus-within{outline:2px solid var(--accent);outline-offset:2px}
-button.go{background:var(--accent);color:#14131f;border:0;padding:14px 22px;border-radius:12px;font:600 16px Sora,sans-serif;cursor:pointer}
-button.go:disabled{opacity:.6;cursor:wait}
-.drop{display:block;border:2px dashed var(--line);border-radius:14px;padding:30px 18px;text-align:center;cursor:pointer;background:var(--panel)}
-.drop:hover{border-color:var(--accent)}
+button.go{background:var(--accent);color:#17142a;border:0;padding:15px 26px;border-radius:13px;font:700 16px Sora,sans-serif;cursor:pointer}
+button.go:hover{filter:brightness(1.08)}button.go:disabled{opacity:.6;cursor:wait}
+.try{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;color:var(--muted);font-size:14px}
+.chip{background:var(--s2);border:1px solid var(--line);color:var(--text);padding:4px 12px;border-radius:999px;font:14px Hind,sans-serif;cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.drop{display:flex;flex-direction:column;align-items:center;gap:6px;border:2px dashed var(--line);border-radius:16px;padding:34px 18px;text-align:center;cursor:pointer;background:var(--bg);transition:border-color .2s,background .2s}
+.drop:hover,.drop.over{border-color:var(--accent);background:var(--s2)}
 .drop input{position:absolute;opacity:0;width:1px;height:1px}
-.hint{color:var(--muted);font-size:14px;margin:10px 0 0}
-.status{color:var(--accent);min-height:24px;margin:14px 0 0}
-#out{margin-top:24px}
-.res{display:flex;gap:24px;align-items:center;flex-wrap:wrap}
-.ring{--c:var(--accent);width:132px;height:132px;border-radius:50%;flex:none;display:grid;place-items:center;
-background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);box-shadow:14px 14px 0 -2px color-mix(in srgb,var(--c) 22%,transparent)}
-.ring span{width:104px;height:104px;border-radius:50%;background:var(--bg);display:grid;place-items:center;font:800 34px Sora,sans-serif}
-.verdict{font:800 28px Sora,sans-serif;color:var(--c)}
-.host{color:var(--muted);word-break:break-all}
-ul{list-style:none;padding:0;margin:28px 0 0;display:grid;gap:8px}
-li{background:var(--panel);border-left:4px solid var(--line);padding:12px 14px;border-radius:8px;word-break:break-word}
-li.danger{border-color:var(--danger)}li.warn{border-color:var(--warn)}li.ok{border-color:var(--safe)}li.info{border-color:var(--accent)}
-.note{color:var(--muted);font-size:14px;margin-top:24px}.note a{color:var(--accent)}
-.err{color:var(--danger)}
+.drop svg{width:34px;height:34px;color:var(--accent)}
+.drop strong{font:600 17px Sora,sans-serif}.drop span{color:var(--muted);font-size:14px}
+.status{color:var(--accent);margin:12px 2px 0;min-height:0}.status:empty{display:none}
+
+#out{margin-top:28px}
+.card{--c:var(--accent);background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:24px;
+box-shadow:12px 12px 0 -1px color-mix(in srgb,var(--c) 20%,transparent)}
+.res{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+.ring{width:128px;height:128px;border-radius:50%;flex:none;display:grid;place-items:center;
+background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);animation:fill 1s cubic-bezier(.2,.8,.2,1)}
+@keyframes fill{from{--p:0}}
+.ring span{width:100px;height:100px;border-radius:50%;background:var(--s1);display:grid;place-items:center;font:800 34px Sora,sans-serif}
+.verdict{font:800 28px/1.15 Sora,sans-serif;color:var(--c);letter-spacing:-.5px}
+.host{color:var(--muted);word-break:break-all;font-size:15px}
+.advice{margin:10px 0 0;max-width:44ch}
+.list{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:8px}
+.list li{display:flex;gap:12px;align-items:flex-start;background:var(--s1);border:1px solid var(--line);padding:13px 14px;border-radius:14px;word-break:break-word}
+.ic{flex:none;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font:800 13px Sora,sans-serif;color:#17142a;background:var(--accent);margin-top:1px}
+.list li.danger .ic{background:var(--danger)}.list li.warn .ic{background:var(--warn)}.list li.ok .ic{background:var(--safe)}
+.list li.info{background:transparent;border-style:dashed;color:var(--muted)}
+.note{color:var(--muted);font-size:14px;margin:22px 2px 0}
+.report{display:inline-block;margin-top:12px;color:var(--text);border:1px solid var(--line);padding:9px 14px;border-radius:12px;text-decoration:none;font-weight:500}
+.report:hover{border-color:var(--accent)}
+.err{color:var(--danger);background:var(--s1);border:1px solid var(--danger);padding:12px 14px;border-radius:14px}
+footer{margin-top:40px;color:var(--muted);font-size:13px;text-align:center}
+@media(max-width:520px){.ghost{font-size:180px}.tab span{font-size:14px}.tab svg{display:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <main>
-  <div class="brand">Shadow<b>X</b></div>
-  <h1>Bharosa karne se pehle scan karo.</h1>
-  <p class="sub">Link, screenshot ya APK file daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#b3a6ff"/><path d="M11 11l11 11M22 11L11 22" stroke="#17142a" stroke-opacity=".28" stroke-width="4" stroke-linecap="round" transform="translate(1.8 1.8)"/><path d="M10 10l11 11M21 10L10 21" stroke="#17142a" stroke-width="4" stroke-linecap="round"/></svg>
+      <span>Shadow<b>X</b></span>
+    </div>
+    <span class="beta">Beta</span>
+  </header>
 
-  <div class="tabs">
-    <button class="tab on" type="button" data-t="url">Website / Link</button>
-    <button class="tab" type="button" data-t="shot">Screenshot</button>
-    <button class="tab" type="button" data-t="apk">APK file</button>
-  </div>
+  <section class="hero">
+    <div class="ghost" aria-hidden="true">X</div>
+    <h1>Bharosa karne se pehle scan karo.</h1>
+    <p class="sub">Link, screenshot ya APK file daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
+  </section>
 
-  <div id="p-url">
-    <form id="f">
-      <input id="u" type="text" placeholder="Link paste karo, jaise sbi-login-secure.xyz" autocomplete="off" required>
-      <button class="go" id="b">Scan karo</button>
-    </form>
-  </div>
+  <section class="panel" id="panel">
+    <div class="tabs" role="tablist">
+      <button class="tab on" type="button" data-t="url"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Link</span></button>
+      <button class="tab" type="button" data-t="shot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 9"/></svg><span>Screenshot</span></button>
+      <button class="tab" type="button" data-t="apk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg><span>APK file</span></button>
+    </div>
+    <p class="hint" id="hint"></p>
 
-  <div id="p-shot" hidden>
-    <label class="drop">
-      <input type="file" id="fs" accept="image/*">
-      Screenshot chuno, ya Ctrl + V se paste karo
-    </label>
-    <p class="hint">Screenshot tere browser mein hi padha jaata hai. Image server pe upload nahi hoti, sirf nikla hua text check hota hai.</p>
-  </div>
+    <div id="p-url">
+      <form id="f">
+        <input id="u" type="text" placeholder="Link paste karo, jaise sbi-login-secure.xyz" autocomplete="off" required>
+        <button class="go" id="b">Scan karo</button>
+      </form>
+      <div class="try">Try karo: <button type="button" class="chip" data-u="chatgpt.com">chatgpt.com</button><button type="button" class="chip" data-u="sbi-login-secure.xyz">sbi-login-secure.xyz</button></div>
+    </div>
 
-  <div id="p-apk" hidden>
-    <label class="drop">
-      <input type="file" id="fa" accept=".apk,application/vnd.android.package-archive">
-      APK file chuno
-    </label>
-    <p class="hint">APK kabhi chalayi nahi jaati. File tere browser mein hi khulti hai, server ko sirf permissions, links aur hash jaate hain.</p>
-  </div>
+    <div id="p-shot" hidden>
+      <label class="drop" id="d-shot">
+        <input type="file" id="fs" accept="image/*">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <strong>Screenshot chuno ya yahan chhod do</strong>
+        <span>Ctrl + V se paste bhi kar sakte ho. Image server pe upload nahi hoti.</span>
+      </label>
+    </div>
 
-  <p class="status" id="st" aria-live="polite"></p>
+    <div id="p-apk" hidden>
+      <label class="drop" id="d-apk">
+        <input type="file" id="fa" accept=".apk,application/vnd.android.package-archive">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <strong>APK file chuno ya yahan chhod do</strong>
+        <span>APK chalayi nahi jaati. File browser mein hi khulti hai.</span>
+      </label>
+    </div>
+
+    <p class="status" id="st" aria-live="polite"></p>
+  </section>
+
   <section id="out" aria-live="polite"></section>
+  <footer>ShadowX risk ka andaza deta hai, pakka faisla nahi.</footer>
 </main>
 
 <script>
-const $ = id => document.getElementById(id), out = $('out'), st = $('st');
+const $ = id => document.getElementById(id), out = $('out'), st = $('st'), panel = $('panel');
 const LABEL = {safe:'Safe lag raha hai', suspicious:'Suspicious hai', dangerous:'Khatarnak hai'};
 const COLOR = {safe:'var(--safe)', suspicious:'var(--warn)', dangerous:'var(--danger)'};
+const ADVICE = {
+  safe:'Koi bada red flag nahi mila. Phir bhi OTP ya paisa dene se pehle ek baar sochna.',
+  suspicious:'Kuch cheezein sahi nahi lag rahi. Isme paisa, OTP ya login details mat daalo.',
+  dangerous:'Ye scam ho sakta hai. Isme click mat karo, kuch install mat karo aur kuch share mat karo.'};
+const ICON = {danger:'!', warn:'!', ok:'\u2713', info:'i'};
+const HINT = {
+  url:'Koi bhi link paste karo. Domain, SSL aur page check honge.',
+  shot:'Scam SMS ya chat ka screenshot daalo. Text padh ke scam pattern pakda jaayega.',
+  apk:'APK file chuno. Permissions aur andar ke links check honge.'};
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 function el(tag, cls, text){ const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+function busy(on, msg){ panel.classList.toggle('busy', on); st.textContent = on ? (msg || '') : ''; }
 
 function setTab(t){
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   ['url','shot','apk'].forEach(k => $('p-' + k).hidden = (k !== t));
-  out.textContent = ''; st.textContent = '';
+  $('hint').textContent = HINT[t]; out.textContent = ''; busy(false);
 }
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.t)));
+setTab('url');
 
 async function call(payload){
   const r = await fetch('/api/index', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -462,17 +529,18 @@ async function call(payload){
 function fail(e){ out.textContent = ''; out.append(el('p', 'err', e.message)); }
 
 // ---- link scan
-$('f').addEventListener('submit', async e => {
-  e.preventDefault();
-  const btn = $('b'); btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = '';
-  try { render(await call({kind:'url', url:$('u').value})); } catch (err) { fail(err); }
-  btn.disabled = false; btn.textContent = 'Scan karo';
-});
+async function doUrl(v){
+  const btn = $('b'); btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = ''; busy(true);
+  try { render(await call({kind:'url', url:v})); } catch (err) { fail(err); }
+  btn.disabled = false; btn.textContent = 'Scan karo'; busy(false);
+}
+$('f').addEventListener('submit', e => { e.preventDefault(); doUrl($('u').value); });
+document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { $('u').value = c.dataset.u; doUrl(c.dataset.u); }));
 
 // ---- screenshot scan (OCR runs in the browser)
 async function doShot(file){
   if (!file || !file.type.startsWith('image/')) return;
-  out.textContent = ''; st.textContent = 'Screenshot padh raha hai... 0%';
+  out.textContent = ''; busy(true, 'Screenshot padh raha hai... 0%');
   try {
     if (!window.Tesseract) throw new Error('OCR library load nahi hui. Internet check karo aur page refresh karo.');
     const res = await Tesseract.recognize(file, 'eng', {logger: m => {
@@ -481,7 +549,7 @@ async function doShot(file){
     st.textContent = 'Text mil gaya, check ho raha hai...';
     render(await call({kind:'text', text: res.data.text}));
   } catch (err) { fail(err); }
-  st.textContent = '';
+  busy(false);
 }
 $('fs').addEventListener('change', e => { doShot(e.target.files[0]); e.target.value = ''; });
 document.addEventListener('paste', e => {
@@ -489,7 +557,6 @@ document.addEventListener('paste', e => {
   if (f && !$('p-shot').hidden) doShot(f);
 });
 
-// ---- APK scan (parsed in the browser)
 // <<AXML
 function parseManifest(buf){
   const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -531,10 +598,9 @@ function parseManifest(buf){
 
 async function doApk(file){
   if (!file) return;
-  out.textContent = '';
+  out.textContent = ''; busy(true, 'APK khol raha hai...');
   try {
     if (!window.JSZip) throw new Error('JSZip load nahi hua. Internet check karo aur page refresh karo.');
-    st.textContent = 'APK khol raha hai...';
     const buf = await file.arrayBuffer();
     const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', buf))].map(b => b.toString(16).padStart(2, '0')).join('');
     const zip = await JSZip.loadAsync(buf);
@@ -550,30 +616,45 @@ async function doApk(file){
     st.textContent = 'Report ban raha hai...';
     render(await call({kind:'apk', apk:{name:file.name, size:file.size, sha256:hash, package:m.pkg, permissions:m.perms, urls:[...urls].slice(0, 80)}}));
   } catch (err) { fail(err); }
-  st.textContent = '';
+  busy(false);
 }
 $('fa').addEventListener('change', e => { doApk(e.target.files[0]); e.target.value = ''; });
 
+// drag and drop
+[['d-shot', doShot], ['d-apk', doApk]].forEach(([id, fn]) => {
+  const z = $(id);
+  z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
+  z.addEventListener('dragleave', () => z.classList.remove('over'));
+  z.addEventListener('drop', e => { e.preventDefault(); z.classList.remove('over'); fn(e.dataTransfer.files[0]); });
+});
+
 // ---- result
+function countUp(node, to){
+  if (reduce || !to){ node.textContent = to; return; }
+  const t0 = performance.now();
+  (function tick(t){ const k = Math.min(1, (t - t0) / 900); node.textContent = Math.round(to * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(tick); })(t0);
+}
 function render(d){
   out.textContent = '';
-  const res = el('div', 'res'), ring = el('div', 'ring');
+  const card = el('div', 'card'); card.style.setProperty('--c', COLOR[d.verdict]);
+  const res = el('div', 'res'), ring = el('div', 'ring'), num = el('span', null, '0');
   ring.style.setProperty('--p', d.score); ring.style.setProperty('--c', COLOR[d.verdict]);
-  ring.append(el('span', null, d.score));
+  ring.append(num); countUp(num, d.score);
   const info = el('div'); info.style.setProperty('--c', COLOR[d.verdict]);
-  info.append(el('div', 'verdict', LABEL[d.verdict]), el('div', 'host', d.host), el('div', 'host', 'Risk score: ' + d.score + '/100'));
-  res.append(ring, info);
-  const ul = el('ul');
-  d.findings.forEach(f => ul.append(el('li', f.level, f.text)));
+  info.append(el('div', 'verdict', LABEL[d.verdict]), el('div', 'host', d.host + '  |  Risk score ' + d.score + '/100'), el('p', 'advice', ADVICE[d.verdict]));
+  res.append(ring, info); card.append(res);
+
+  const ul = el('ul', 'list');
+  d.findings.forEach(f => { const li = el('li', f.level); li.append(el('span', 'ic', ICON[f.level] || 'i'), el('span', null, f.text)); ul.append(li); });
+
   const keys = [];
   if (!d.apis.virustotal) keys.push('VirusTotal');
   if (!d.apis.safe_browsing) keys.push('Google Safe Browsing');
-  const note = el('p', 'note', 'Koi bhi scanner 100% pakka nahi hota. Shak ho to paise ya OTP mat do. ');
-  if (keys.length) note.append(keys.join(' aur ') + ' ki API key abhi set nahi hai, isliye wo check skip hue. ');
-  const a = el('a', null, 'Scam hua? cybercrime.gov.in ya 1930 pe report karo.');
+  const note = el('p', 'note', keys.length ? keys.join(' aur ') + ' ki API key abhi set nahi hai, isliye wo check skip hue.' : '');
+  const a = el('a', 'report', 'Scam hua? cybercrime.gov.in ya 1930 pe report karo');
   a.href = 'https://cybercrime.gov.in'; a.target = '_blank'; a.rel = 'noopener';
-  note.append(a);
-  out.append(res, ul, note);
+  out.append(card, ul, note, a);
+  card.scrollIntoView({behavior: reduce ? 'auto' : 'smooth', block: 'nearest'});
 }
 </script>
 </body>
