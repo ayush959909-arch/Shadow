@@ -1,4 +1,4 @@
-"""ShadowX - URL / screenshot / SMS / email / APK scanner (FastAPI) for Vercel.
+"""ShadowX - Phase 1: URL scanner (FastAPI) for Vercel.
 Optional env keys (set in Vercel > Settings > Environment Variables): VT_API_KEY (VirusTotal), GSB_API_KEY (Google Safe Browsing)
 """
 import asyncio, base64, ipaddress, os, re, socket, ssl
@@ -10,9 +10,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
-from email import message_from_string, policy
-from email.utils import parseaddr
-import html as html_lib
 
 app = FastAPI(title="ShadowX")
 VT_KEY = os.getenv("VT_API_KEY")
@@ -24,6 +21,9 @@ BRANDS = ["sbi", "hdfc", "icici", "axis", "paytm", "phonepe", "gpay", "google", 
 RISKY_TLDS = {"xyz", "top", "click", "icu", "buzz", "tk", "ml", "ga", "cf", "gq", "work",
               "loan", "rest", "cyou", "sbs", "lol", "zip", "mov"}
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "cutt.ly", "is.gd", "rb.gy", "shorturl.at", "goo.gl"}
+SCAM_WORDS = ["kyc", "urgent", "verify your account", "account suspended", "account blocked",
+              "lottery", "you have won", "claim your prize", "otp", "digital arrest",
+              "free gift", "pan card update", "aadhaar update", "limited time"]
 TWO_PART = {"co.in", "org.in", "gov.in", "net.in", "ac.in", "co.uk", "com.au", "com.br"}
 UA = {"User-Agent": "Mozilla/5.0 (ShadowX scanner)"}
 
@@ -32,7 +32,6 @@ class Req(BaseModel):
     kind: str = "url"
     url: str = ""
     text: str = ""
-    sender: str = ""
     apk: Optional[dict] = None
 
 
@@ -47,18 +46,13 @@ def is_public_host(host: str) -> bool:
     """SSRF guard: never fetch private/internal addresses."""
     try:
         infos = socket.getaddrinfo(host, None)
-    except (socket.gaierror, UnicodeError):
+    except socket.gaierror:
         return False
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
-
-
-async def public_host(host: str) -> bool:
-    # getaddrinfo is blocking, so run it in a thread
-    return await asyncio.to_thread(is_public_host, host)
 
 
 def add(findings, level, text, points=0):
@@ -131,24 +125,11 @@ async def tls_check(host, findings):
         pass  # no HTTPS available; already flagged above
 
 
-# Context-based page signals (instead of a plain scam-word list)
-PAGE_SIGNALS = [
-    (r"<input[^>]+(?:name|id|placeholder)=[\"'][^\"']*(?:otp|cvv|card ?number|upi ?pin|atm ?pin|aadhaar)",
-     "danger", "Page ke form mein OTP / CVV / card / Aadhaar jaisi sensitive detail maangi ja rahi hai. Asli bank ya company ye details link wale page pe nahi leti.", 25),
-    (r"\b(?:account|card|sim|connection)\b[^.<]{0,40}\b(?:blocked|suspended|deactivated|disconnected)\b|\bkyc\b[^.<]{0,40}\b(?:expired|pending|update)",
-     "warn", "Page account band hone ya KYC expire hone ka darr dikha raha hai, taaki aap bina soche details daal do.", 20),
-    (r"you have won|you won|claim your (?:prize|reward)|lucky draw|lottery",
-     "warn", "Page inaam ya lottery ka laalach de raha hai. Jis contest mein aapne hissa nahi liya, wahan jeetna scam ka pattern hai.", 20),
-    (r"(?:within|in) \d+ ?(?:hours|hrs|minutes|mins)|last chance|act now",
-     "warn", "Page jaldi karne ka dabav daal raha hai. Scammers sochne ka time nahi dete.", 8),
-]
-
-
 async def page_check(url, findings):
     html, cur = "", url
     async with httpx.AsyncClient(timeout=8, headers=UA, follow_redirects=False) as c:
         for _ in range(4):
-            if not await public_host(urlparse(cur).hostname or ""):
+            if not is_public_host(urlparse(cur).hostname or ""):
                 return
             r = await c.get(cur)
             if r.is_redirect and "location" in r.headers:
@@ -159,13 +140,9 @@ async def page_check(url, findings):
     if cur != url and urlparse(cur).hostname != urlparse(url).hostname:
         add(findings, "warn", f"Link doosri site pe redirect karta hai: {urlparse(cur).hostname}", 10)
     low = html.lower()
-    hit = 0
-    for pat, lvl, msg, pts in PAGE_SIGNALS:
-        if re.search(pat, low):
-            add(findings, lvl, msg, pts)
-            hit += 1
-    if hit >= 2:
-        add(findings, "danger", "Ek hi page par darr, laalach aur details ki maang ek saath hain. Ye phishing pages ka classic combination hai.", 15)
+    hits = [w for w in SCAM_WORDS if w in low]
+    if hits:
+        add(findings, "warn", "Page mein scam wale words mile: " + ", ".join(hits[:5]), min(10 + 5 * len(hits), 25))
     if re.search(r"type=[\"']?password", low):
         add(findings, "warn", "Page par password / login form hai - sirf tabhi daalo jab site 100% asli ho.", 10)
         for m in re.finditer(r"<form[^>]+action=[\"']?(https?://[^\"'\s>]+)", low):
@@ -203,13 +180,10 @@ async def safe_browsing(url, findings):
 
 
 def finish(host, findings):
-    # Score uses ALL findings; display shows only the top 3 risk reasons + info/ok lines
     score = min(100, sum(f["points"] for f in findings))
     findings.sort(key=lambda f: -f["points"])
-    risky = [f for f in findings if f["points"] > 0][:3]
-    rest = [f for f in findings if f["points"] == 0]
     verdict = "safe" if score < 25 else "suspicious" if score < 55 else "dangerous"
-    return {"host": host, "score": score, "verdict": verdict, "findings": risky + rest,
+    return {"host": host, "score": score, "verdict": verdict, "findings": findings,
             "apis": {"virustotal": bool(VT_KEY), "safe_browsing": bool(GSB_KEY)}}
 
 
@@ -225,7 +199,7 @@ async def analyze_url(raw: str):
     findings: list = []
     url_checks(url, host, reg, findings)
     tasks = [domain_age(reg, findings), virustotal(url, findings), safe_browsing(url, findings)]
-    if await public_host(host):
+    if is_public_host(host):
         tasks += [tls_check(host, findings), page_check(url, findings)]
     else:
         add(findings, "warn", "Ye domain resolve nahi ho raha ya internal address hai, isliye page scan nahi hua.", 10)
@@ -239,13 +213,13 @@ async def analyze_url(raw: str):
 TEXT_RULES = [
     (r"\bkyc\b|account (?:will be )?(?:blocked|suspended|closed|deactivated)|pan (?:card )?(?:update|expired)|aadhaar (?:update|link)",
      "danger", "KYC ya account band hone ka darr dikhaya gaya hai. Banks aise link se KYC nahi karte.", 30),
-    (r"lottery|you have won|you won|lucky draw|claim (?:your )?prize|prize money|\bkbc\b|congratulations[^.]{0,40}(?:won|prize|selected)",
+    (r"lottery|you have won|you won|lucky draw|\bprize\b|\bkbc\b|congratulations",
      "danger", "Lottery ya inaam ka laalach. Ye sabse common scam hai.", 30),
-    (r"digital arrest|\bcbi\b|narcotics|enforcement directorate|cyber ?crime branch|arrest warrant|parcel[^.]{0,60}(?:seized|arrest|customs|illegal|drugs)|customs[^.]{0,40}(?:seized|duty|parcel)",
+    (r"digital arrest|\bcbi\b|narcotics|customs|enforcement directorate|cyber ?crime branch|arrest warrant|parcel",
      "danger", "Police, CBI ya courier ke naam pe dhamki. Digital arrest scam jaisa lagta hai. Asli police video call pe arrest nahi karti.", 35),
-    (r"work from home|part[- ]time job|earn[^.]{0,20}(?:rs\.?|inr|₹)?\s?\d|daily income|(?:complete|finish) (?:\d+ )?tasks?|task (?:reward|commission)|like (?:and|&) subscribe",
+    (r"work from home|part[- ]time job|earn (?:rs\.?|inr)?\s?\d|daily income|per day|like (?:and|&) subscribe|\btasks?\b",
      "warn", "Ghar baithe kamai ya job ka offer. Fake job scam ka pattern.", 25),
-    (r"\botp\b|\bcvv\b|(?:upi|atm|card) pin|card number|share[^.]{0,20}password",
+    (r"\botp\b|\bcvv\b|\bpin\b|password|card number",
      "danger", "OTP, PIN, CVV ya password maanga ja raha hai. Ye kabhi kisi ko mat batao.", 25),
     (r"urgent|immediately|within \d+ ?(?:hours|hrs|minutes|mins)|last chance|expires? (?:today|soon)",
      "warn", "Jaldi karne ka dabav. Scammers sochne ka time nahi dete.", 10),
@@ -264,17 +238,19 @@ UPI_RE = re.compile(r"\b[\w.\-]{2,}@(?:ok\w+|ybl|ibl|axl|paytm|upi|apl|sbi|hdfcb
 PHONE_RE = re.compile(r"(?<!\d)(?:\+91[\s-]?|0)?[6-9]\d{9}(?!\d)")
 
 
-async def text_findings(text: str, extra_links=None):
-    """Shared scam-pattern + link scan used by screenshot, SMS and email."""
+async def analyze_text(text: str):
+    if len(text.strip()) < 10:
+        raise HTTPException(400, "Screenshot se text nahi nikla. Saaf aur bada screenshot try karo.")
+    text = text[:5000]
     low = text.lower()
     findings: list = []
     for pat, lvl, msg, pts in TEXT_RULES:
         if re.search(pat, low):
             add(findings, lvl, msg, pts)
-    links = list(extra_links or [])
+    links = []
     for m in LINK_RE.findall(text):
         m = m.strip(".,;:)]}>\"'")
-        if "@" not in m and m.lower() not in [x.lower() for x in links]:
+        if m.lower() not in [x.lower() for x in links] and "@" not in m:
             links.append(m)
     upi = list(dict.fromkeys(UPI_RE.findall(text)))[:5]
     phones = list(dict.fromkeys(re.sub(r"\D", "", p)[-10:] for p in PHONE_RE.findall(text)))[:5]
@@ -283,237 +259,409 @@ async def text_findings(text: str, extra_links=None):
         if isinstance(r, dict) and r["verdict"] != "safe":
             lab = "Khatarnak" if r["verdict"] == "dangerous" else "Suspicious"
             add(findings, "danger" if r["verdict"] == "dangerous" else "warn",
-                f"Link {r['host']} scan kiya: {lab} (risk {r['score']}/100).", 40 if r["verdict"] == "dangerous" else 20)
+                f"Screenshot ka link {r['host']} scan kiya: {lab} (risk {r['score']}/100).", 40 if r["verdict"] == "dangerous" else 20)
         elif isinstance(r, dict):
-            add(findings, "ok", f"Link {r['host']} safe lag raha hai.")
-    if links:
-        add(findings, "info", "Mile hue links: " + ", ".join(links[:5]), 0)
-    if upi:
-        add(findings, "info", "UPI ID mili: " + ", ".join(upi) + ". Unknown UPI ID pe paisa mat bhejo.", 0)
-    if phones:
-        add(findings, "info", "Phone number mile: " + ", ".join(phones) + ". Unknown number pe bharosa mat karo.", 0)
-    return findings
-
-
-async def analyze_text(text: str):
-    if len(text.strip()) < 10:
-        raise HTTPException(400, "Screenshot se text nahi nikla. Saaf aur bada screenshot try karo.")
-    findings = await text_findings(text[:5000])
+            add(findings, "ok", f"Screenshot ka link {r['host']} safe lag raha hai.")
+    if links: add(findings, "info", "Screenshot mein mile links: " + ", ".join(links[:5]), 0)
+    if upi: add(findings, "info", "UPI ID mili: " + ", ".join(upi) + ". Unknown UPI ID pe paisa mat bhejo.", 0)
+    if phones: add(findings, "info", "Phone number mile: " + ", ".join(phones) + ". Unknown number pe bharosa mat karo.", 0)
     if not findings:
         add(findings, "ok", "Koi scam pattern nahi mila. Phir bhi paisa ya OTP dene se pehle sochna.")
     return finish("Screenshot scan", findings)
 
 
-# ---------- SMS ----------
-SENDER_RE = re.compile(r"^[A-Za-z]{2}-[A-Za-z0-9]{3,8}(?:-[A-Za-z])?$")
+# ---------- Phase 3: APK analysis (file stays in the browser; only metadata comes here) ----------
+APK_PERMS = {
+    "READ_SMS": (20, "SMS padh sakti hai. OTP chori ho sakte hain."),
+    "RECEIVE_SMS": (15, "Aane wale SMS dekh sakti hai (OTP chori ka risk)."),
+    "SEND_SMS": (15, "Aapke naam se SMS bhej sakti hai (premium SMS fraud)."),
+    "BIND_ACCESSIBILITY_SERVICE": (25, "Accessibility control maangti hai. Banking trojan screen padh ke paisa nikaal sakte hain."),
+    "SYSTEM_ALERT_WINDOW": (15, "Doosri apps ke upar overlay dikha sakti hai (fake login screen)."),
+    "BIND_DEVICE_ADMIN": (25, "Device admin banna chahti hai. Uninstall karna mushkil ho sakta hai."),
+    "BIND_NOTIFICATION_LISTENER_SERVICE": (20, "Saare notifications padh sakti hai (OTP bhi)."),
+    "READ_CALL_LOG": (15, "Call history padh sakti hai."),
+    "PROCESS_OUTGOING_CALLS": (15, "Aapki calls ko monitor ya redirect kar sakti hai."),
+    "READ_CONTACTS": (10, "Aapke saare contacts padh sakti hai."),
+    "RECORD_AUDIO": (10, "Mic se recording kar sakti hai."),
+    "REQUEST_INSTALL_PACKAGES": (10, "Aur apps install kar sakti hai."),
+    "MANAGE_EXTERNAL_STORAGE": (10, "Phone ki saari files ka access maangti hai."),
+    "QUERY_ALL_PACKAGES": (5, "Phone mein installed saari apps ki list dekh sakti hai."),
+}
+BENIGN = {"google.com", "googleapis.com", "gstatic.com", "android.com", "w3.org", "apache.org", "xmlpull.org",
+          "mozilla.org", "facebook.com", "firebaseio.com", "firebase.com", "crashlytics.com", "googleusercontent.com",
+          "googlesyndication.com", "doubleclick.net", "unity3d.com", "adjust.com", "appsflyer.com", "microsoft.com",
+          "sentry.io", "openssl.org", "oracle.com", "jetbrains.com", "kotlinlang.org", "example.com", "slf4j.org",
+          "ietf.org", "github.com", "whatsapp.com", "amazon.com", "amazonaws.com", "play.google.com"}
 
 
-async def analyze_sms(text: str, sender: str):
-    if len(text.strip()) < 5:
-        raise HTTPException(400, "SMS ka text paste karo.")
-    text, sender = text[:2000], sender.strip()[:40]
-    findings = await text_findings(text)
-    low = text.lower()
-    claims = any(b in low for b in BRANDS) or any(f["level"] == "danger" for f in findings)
-    if sender:
-        digits = re.sub(r"[\s-]", "", sender)
-        if SENDER_RE.match(sender):
-            add(findings, "info", f"Sender ID {sender} company wale format jaisa hai. Format asli ho sakta hai, par spoof bhi hota hai.", 0)
-        elif re.fullmatch(r"\+?(?:91)?0?[6-9]\d{9}", digits):
-            add(findings, "warn", "SMS normal mobile number se aaya hai. Banks aur companies apne official sender ID (jaise VM-HDFCBK) se SMS bhejti hain.", 20 if claims else 8)
-        elif digits.startswith("+") and not digits.startswith("+91"):
-            add(findings, "warn", "SMS international number se aaya hai.", 12)
-    if re.search(r"dear (?:customer|user|sir|madam|account holder|valued)", low):
-        add(findings, "warn", "Generic greeting (Dear customer). Asli bank aapka naam use karta hai.", 8)
-    if not findings:
-        add(findings, "ok", "Koi scam pattern nahi mila. Phir bhi link ya OTP ke liye sochna.")
-    return finish("SMS scan", findings)
-
-
-# ---------- Email ----------
-FREEMAIL = {"gmail.com", "yahoo.com", "yahoo.in", "outlook.com", "hotmail.com", "rediffmail.com",
-            "proton.me", "protonmail.com", "icloud.com"}
-BAD_EXT = {"exe", "scr", "bat", "cmd", "apk", "js", "vbs", "jar", "iso", "img", "lnk", "msi", "ps1"}
-RISKY_EXT = {"html", "htm", "zip", "rar", "7z", "docm", "xlsm", "pptm"}
-
-
-def parse_email(raw: str):
-    info = {"name": "", "addr": "", "reply": "", "auth": "", "subject": "", "text": "", "anchors": [], "files": [], "headers": False}
-    if not re.search(r"^(?:from|subject|received|return-path|message-id|authentication-results):", raw, re.I | re.M):
-        info["text"] = raw
-        return info
-    info["headers"] = True
-    msg = message_from_string(raw, policy=policy.default)
-    info["name"], info["addr"] = parseaddr(str(msg.get("From", "")))
-    info["reply"] = parseaddr(str(msg.get("Reply-To", "")))[1]
-    info["subject"] = str(msg.get("Subject", ""))
-    info["auth"] = " ".join(str(x) for x in (msg.get_all("Authentication-Results") or [])) + " " + str(msg.get("Received-SPF", ""))
-    texts = []
-    for part in msg.walk():
-        fn = part.get_filename()
-        if fn:
-            info["files"].append(str(fn))
-            continue
-        ct = part.get_content_type()
-        if ct in ("text/plain", "text/html"):
-            try:
-                s = part.get_content()
-            except Exception:
-                continue
-            if ct == "text/html":
-                for href, inner in re.findall(r"<a\s[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", s, re.I | re.S):
-                    info["anchors"].append((html_lib.unescape(re.sub(r"<[^>]+>", "", inner)).strip(), html_lib.unescape(href)))
-                s = re.sub(r"<(?:script|style).*?</(?:script|style)>", " ", s, flags=re.I | re.S)
-                s = html_lib.unescape(re.sub(r"<[^>]+>", " ", s))
-            texts.append(s)
-    info["text"] = "\n".join(texts)
-    return info
-
-
-async def analyze_email(raw: str):
-    if len(raw.strip()) < 20:
-        raise HTTPException(400, "Email paste karo (poora ya sirf body).")
-    try:
-        e = parse_email(raw[:200000])
-    except Exception:
-        e = {"name": "", "addr": "", "reply": "", "auth": "", "subject": "", "text": raw[:20000], "anchors": [], "files": [], "headers": False}
+async def analyze_apk(a: dict):
+    sha = str(a.get("sha256", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise HTTPException(400, "APK ka hash galat hai.")
+    pkg = str(a.get("package") or "unknown")[:120]
+    perms = [p for p in (a.get("permissions") or []) if isinstance(p, str) and re.fullmatch(r"android\.permission\.[A-Z_]+", p)][:100]
+    urls = [u for u in (a.get("urls") or []) if isinstance(u, str)][:80]
+    names = {p.split(".")[-1] for p in perms}
     findings: list = []
-    dom = e["addr"].split("@")[-1].lower() if "@" in e["addr"] else ""
-    if not e["headers"]:
-        add(findings, "info", "Sirf email ki body paste hui hai, isliye sender aur headers check nahi hue. Poora email (Show original) paste karoge to zyada accurate hoga.", 0)
-    if dom:
-        reg = registered_domain(dom)
-        tmp: list = []
-        url_checks("https://" + dom, dom, reg, tmp)
-        for f in tmp:
-            if f["points"]:
-                add(findings, f["level"], "Sender domain: " + f["text"], f["points"])
+    for n, (pts, msg) in APK_PERMS.items():
+        if n in names:
+            add(findings, "danger" if pts >= 20 else "warn", msg, pts)
+    if names & {"READ_SMS", "RECEIVE_SMS"} and names & {"BIND_ACCESSIBILITY_SERVICE", "SYSTEM_ALERT_WINDOW", "BIND_NOTIFICATION_LISTENER_SERVICE"}:
+        add(findings, "danger", "SMS access ke saath screen ya notification control. Banking trojan jaisa pattern.", 20)
+    add(findings, "info", f"Package: {pkg}. Permissions: {len(perms)}. SHA-256: {sha[:16]}...", 0)
+    if VT_KEY:
         try:
-            age: list = []
-            await domain_age(reg, age)
-            for f in age:
-                add(findings, f["level"], "Sender " + f["text"][0].lower() + f["text"][1:], f["points"])
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"https://www.virustotal.com/api/v3/files/{sha}", headers={"x-apikey": VT_KEY})
+            if r.status_code == 200:
+                s = r.json()["data"]["attributes"]["last_analysis_stats"]
+                bad = s.get("malicious", 0) + s.get("suspicious", 0)
+                if bad:
+                    add(findings, "danger", f"VirusTotal pe {bad} security engines ne is APK ko flag kiya.", min(40 + 5 * bad, 70))
+                else:
+                    add(findings, "ok", "VirusTotal pe is file ko kisi engine ne flag nahi kiya.")
+            elif r.status_code == 404:
+                add(findings, "info", "VirusTotal pe ye file pehle kabhi scan nahi hui (nayi ya rare file).", 0)
         except Exception:
             pass
-        nm = e["name"].lower()
-        for b in BRANDS:
-            if b in nm and b not in dom:
-                add(findings, "danger", f"Sender ka naam '{e['name']}' hai par email {dom} se aaya hai.", 30)
-                break
-        else:
-            if dom in FREEMAIL and any(b in (nm + " " + e["subject"].lower()) for b in BRANDS):
-                add(findings, "warn", "Bank ya company ke naam ka email free email service se aaya hai. Asli companies apne domain se bhejti hain.", 20)
-        if e["reply"] and "@" in e["reply"] and registered_domain(e["reply"].split("@")[-1].lower()) != reg:
-            add(findings, "warn", f"Reply-To address ({e['reply']}) sender se alag domain ka hai. Jawab scammer ke paas jaayega.", 20)
-    auth = e["auth"].lower()
-    if re.search(r"\b(?:spf|dkim|dmarc)=(?:fail|softfail|none|permerror|temperror)", auth):
-        add(findings, "danger", "Email authentication fail hua (SPF/DKIM/DMARC). Ye email us domain se nahi aaya ho sakta jo dikh raha hai.", 25)
-    elif re.search(r"\b(?:spf|dkim|dmarc)=pass", auth):
-        add(findings, "ok", "SPF/DKIM/DMARC pass hua. Matlab email us domain se aaya, par domain asli hai ya nahi, ye alag dekhna padta hai.")
-    for fn in e["files"][:10]:
-        ext = fn.lower().rsplit(".", 1)[-1] if "." in fn else ""
-        if ext in BAD_EXT:
-            add(findings, "danger", f"Khatarnak attachment: {fn}. Ise kabhi open mat karo.", 30)
-        elif ext in RISKY_EXT:
-            add(findings, "warn", f"Risky attachment type: {fn}. Unknown sender ki aisi file mat kholo.", 20)
-
-    # Links: check that the visible text matches where the link really goes
-    hrefs, mismatch = [], False
-    for shown, href in e["anchors"]:
-        hh = (urlparse(href).hostname or "").lower()
-        if not hh:
-            continue
-        sm = LINK_RE.search(shown)
-        if sm and not mismatch:
-            s = sm.group(0)
-            sh = (urlparse(s if s.lower().startswith("http") else "https://" + s).hostname or "").lower()
-            if sh and registered_domain(sh) != registered_domain(hh):
-                add(findings, "danger", f"Link par '{sh}' likha hai par asal mein {hh} pe le jaata hai. Ye phishing ki classic trick hai.", 30)
-                mismatch = True
-        if href not in hrefs:
-            hrefs.append(href)
-
-    body = (e["subject"] + "\n" + e["text"])[:5000]
-    findings += await text_findings(body, extra_links=hrefs[:3])
+    hosts = {}
+    for u in urls:
+        h = (urlparse(u).hostname or "").lower().rstrip(".")
+        if h and "." in h and registered_domain(h) not in BENIGN:
+            hosts.setdefault(h, u)
+    bad_hosts = []
+    for h, u in list(hosts.items())[:15]:
+        tmp: list = []
+        url_checks(u, h, registered_domain(h), tmp)
+        if sum(f["points"] for f in tmp) >= 30:
+            bad_hosts.append(h)
+    for h in bad_hosts[:2]:
+        add(findings, "danger", f"APK ke andar suspicious link mila: {h}", 20)
+    if hosts:
+        add(findings, "info", "APK ke andar mile domains: " + ", ".join(list(hosts)[:8]), 0)
     if not any(f["points"] for f in findings):
-        add(findings, "ok", "Koi bada scam sign nahi mila. Phir bhi link ya attachment kholne se pehle sender confirm kar lo.")
-    return finish(dom or "Email scan", findings)
+        add(findings, "ok", "Koi khaas khatarnak permission ya link nahi mila.")
+    return finish(pkg, findings)
 
 
-# ---------- APK ----------
-DANGEROUS_PERMS = {
-    "READ_SMS": ("danger", "App aapke SMS padh sakti hai (OTP chori ho sakte hain).", 25),
-    "RECEIVE_SMS": ("warn", "App incoming SMS dekh sakti hai (OTP chori ho sakte hain).", 15),
-    "SEND_SMS": ("warn", "App aapke naam se SMS bhej sakti hai (premium SMS fraud).", 15),
-    "BIND_ACCESSIBILITY_SERVICE": ("danger", "App Accessibility access maangti hai. Isse screen padhi aur control ki ja sakti hai, banking trojans yahi use karte hain.", 30),
-    "SYSTEM_ALERT_WINDOW": ("warn", "App doosri apps ke upar fake screen dikha sakti hai (overlay attack).", 15),
-    "REQUEST_INSTALL_PACKAGES": ("warn", "App chupke se aur apps install kar sakti hai.", 15),
-    "BIND_DEVICE_ADMIN": ("danger", "App Device Admin access maangti hai, uninstall karna mushkil ho sakta hai.", 25),
-    "READ_CALL_LOG": ("warn", "App aapka call history padh sakti hai.", 10),
-    "READ_CONTACTS": ("warn", "App aapke saare contacts padh sakti hai.", 8),
-    "RECORD_AUDIO": ("warn", "App mic se recording kar sakti hai.", 8),
-}
+
+@app.post("/api/index")
+@app.post("/api/scan/url")
+async def scan(body: Req):
+    if body.kind == "text":
+        return await analyze_text(body.text)
+    if body.kind == "apk":
+        return await analyze_apk(body.apk or {})
+    return await analyze_url(body.url)
 
 
-async def analyze_apk(apk: Optional[dict]):
-    if not apk:
-        raise HTTPException(400, "APK ki details nahi mili.")
-    findings: list = []
-    name = str(apk.get("name") or apk.get("label") or "")[:80]
-    pkg = str(apk.get("package") or apk.get("pkg") or "")[:120].lower()
-    perms = [str(p).split(".")[-1].upper() for p in (apk.get("permissions") or [])][:200]
-    for p, (lvl, msg, pts) in DANGEROUS_PERMS.items():
-        if p in perms:
-            add(findings, lvl, msg, pts)
-    for b in BRANDS:
-        if (b in name.lower() or b in pkg) and not pkg.startswith(("com." + b, "in." + b, "net." + b, "org." + b)) and "." in pkg:
-            add(findings, "danger", f"App ka naam/package '{b}' jaisa hai par package {pkg} hai. Asli app ka package alag hota hai.", 30)
-            break
-    sensitive = {"READ_SMS", "RECEIVE_SMS", "BIND_ACCESSIBILITY_SERVICE"} & set(perms)
-    if len(sensitive) >= 2:
-        add(findings, "danger", "SMS aur Accessibility jaisi permissions ek saath hain. Ye banking malware ka common combination hai.", 15)
-    if not findings:
-        add(findings, "ok", "Koi risky permission nahi mili. Phir bhi app sirf Play Store se hi install karo.")
-    return finish(name or pkg or "APK scan", findings)
+PAGE = r'''<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowX - Scam aur fraud scanner</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🕶️</text></svg>">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;800&family=Hind:wght@400;500;600&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+@property --p{syntax:'<number>';inherits:false;initial-value:0}
+:root{--bg:#12111c;--s1:#1b1a2b;--s2:#232238;--line:#34324d;--text:#efecfb;--muted:#9d99ba;
+--accent:#b3a6ff;--safe:#4fd1a1;--warn:#f3b34f;--danger:#ff6b64;--c:var(--accent)}
+*{box-sizing:border-box}[hidden]{display:none!important}
+html{background:var(--bg)}
+body{margin:0;color:var(--text);font:16px/1.65 Hind,system-ui,sans-serif;min-height:100vh;
+background:radial-gradient(900px 420px at 85% -80px,rgba(143,125,255,.20),transparent 70%),var(--bg)}
+main{max-width:760px;margin:0 auto;padding:28px 20px 90px}
+.top{display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:10px;font:800 22px Sora,sans-serif;letter-spacing:-.5px}
+.brand b{color:var(--accent)}
+.mark{width:34px;height:34px}
+.beta{font-size:13px;color:var(--muted);border:1px solid var(--line);padding:2px 10px;border-radius:999px}
+.hero{position:relative;padding:56px 0 34px;overflow:hidden}
+.ghost{position:absolute;right:-6px;top:6px;font:800 260px/1 Sora,sans-serif;color:transparent;
+-webkit-text-stroke:2px rgba(179,166,255,.22);text-shadow:18px 18px 0 rgba(179,166,255,.07);user-select:none;pointer-events:none}
+h1{position:relative;font:800 clamp(34px,7vw,56px)/1.06 Sora,sans-serif;letter-spacing:-1.5px;margin:0 0 14px;max-width:13ch}
+.sub{position:relative;color:var(--muted);margin:0;max-width:46ch;font-size:17px}
 
+.panel{position:relative;background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:18px;
+box-shadow:0 40px 70px -40px rgba(0,0,0,.8);overflow:hidden}
+.panel.busy::before{content:"";position:absolute;left:0;top:0;height:3px;width:40%;background:linear-gradient(90deg,transparent,var(--accent),transparent);
+animation:sweep 1.1s linear infinite}
+@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(260%)}}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:var(--s2);padding:4px;border-radius:14px}
+.tab{display:flex;align-items:center;justify-content:center;gap:8px;background:none;border:0;color:var(--muted);
+padding:11px 8px;border-radius:10px;font:500 15px Hind,sans-serif;cursor:pointer;transition:background .2s,color .2s}
+.tab svg{width:18px;height:18px;flex:none}
+.tab:hover{color:var(--text)}
+.tab.on{background:var(--accent);color:#17142a;font-weight:600}
+.hint{color:var(--muted);font-size:15px;margin:14px 2px 14px}
+form{display:flex;gap:10px;flex-wrap:wrap}
+input[type=text]{flex:1 1 260px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:15px 16px;border-radius:13px;font:17px Hind,sans-serif}
+input[type=text]::placeholder{color:#6d6a8a}
+input:focus,button:focus-visible,.drop:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+button.go{background:var(--accent);color:#17142a;border:0;padding:15px 26px;border-radius:13px;font:700 16px Sora,sans-serif;cursor:pointer}
+button.go:hover{filter:brightness(1.08)}button.go:disabled{opacity:.6;cursor:wait}
+.try{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;color:var(--muted);font-size:14px}
+.chip{background:var(--s2);border:1px solid var(--line);color:var(--text);padding:4px 12px;border-radius:999px;font:14px Hind,sans-serif;cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.drop{display:flex;flex-direction:column;align-items:center;gap:6px;border:2px dashed var(--line);border-radius:16px;padding:34px 18px;text-align:center;cursor:pointer;background:var(--bg);transition:border-color .2s,background .2s}
+.drop:hover,.drop.over{border-color:var(--accent);background:var(--s2)}
+.drop input{position:absolute;opacity:0;width:1px;height:1px}
+.drop svg{width:34px;height:34px;color:var(--accent)}
+.drop strong{font:600 17px Sora,sans-serif}.drop span{color:var(--muted);font-size:14px}
+.status{color:var(--accent);margin:12px 2px 0;min-height:0}.status:empty{display:none}
 
-# ---------- Routes ----------
-INDEX_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>ShadowX</title>
-<style>body{font-family:system-ui;max-width:640px;margin:2rem auto;padding:0 1rem}
-textarea,input,select,button{width:100%;margin:.4rem 0;padding:.6rem;font-size:1rem;box-sizing:border-box}
-.f{padding:.5rem;margin:.3rem 0;border-radius:6px;background:#eee}.danger{background:#fdd}.warn{background:#ffe9b8}.ok{background:#d9f5dd}</style></head>
-<body><h2>ShadowX</h2>
-<select id="k"><option value="url">Link</option><option value="sms">SMS</option><option value="email">Email</option><option value="text">Screenshot text</option></select>
-<input id="s" placeholder="Sender (sirf SMS ke liye)"><textarea id="t" rows="6" placeholder="Link ya text yahan paste karo"></textarea>
-<button onclick="go()">Scan</button><div id="o"></div>
+#out{margin-top:28px}
+.card{--c:var(--accent);background:var(--s1);border:1px solid var(--line);border-radius:22px;padding:24px;
+box-shadow:12px 12px 0 -1px color-mix(in srgb,var(--c) 20%,transparent)}
+.res{display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+.ring{width:128px;height:128px;border-radius:50%;flex:none;display:grid;place-items:center;
+background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);animation:fill 1s cubic-bezier(.2,.8,.2,1)}
+@keyframes fill{from{--p:0}}
+.ring span{width:100px;height:100px;border-radius:50%;background:var(--s1);display:grid;place-items:center;font:800 34px Sora,sans-serif}
+.verdict{font:800 28px/1.15 Sora,sans-serif;color:var(--c);letter-spacing:-.5px}
+.host{color:var(--muted);word-break:break-all;font-size:15px}
+.advice{margin:10px 0 0;max-width:44ch}
+.list{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:8px}
+.list li{display:flex;gap:12px;align-items:flex-start;background:var(--s1);border:1px solid var(--line);padding:13px 14px;border-radius:14px;word-break:break-word}
+.ic{flex:none;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font:800 13px Sora,sans-serif;color:#17142a;background:var(--accent);margin-top:1px}
+.list li.danger .ic{background:var(--danger)}.list li.warn .ic{background:var(--warn)}.list li.ok .ic{background:var(--safe)}
+.list li.info{background:transparent;border-style:dashed;color:var(--muted)}
+.note{color:var(--muted);font-size:14px;margin:22px 2px 0}
+.report{display:inline-block;margin-top:12px;color:var(--text);border:1px solid var(--line);padding:9px 14px;border-radius:12px;text-decoration:none;font-weight:500}
+.report:hover{border-color:var(--accent)}
+.err{color:var(--danger);background:var(--s1);border:1px solid var(--danger);padding:12px 14px;border-radius:14px}
+footer{margin-top:40px;color:var(--muted);font-size:13px;text-align:center}
+@media(max-width:520px){.ghost{font-size:180px}.tab span{font-size:14px}.tab svg{display:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#b3a6ff"/><path d="M11 11l11 11M22 11L11 22" stroke="#17142a" stroke-opacity=".28" stroke-width="4" stroke-linecap="round" transform="translate(1.8 1.8)"/><path d="M10 10l11 11M21 10L10 21" stroke="#17142a" stroke-width="4" stroke-linecap="round"/></svg>
+      <span>Shadow<b>X</b></span>
+    </div>
+    <span class="beta">Beta</span>
+  </header>
+
+  <section class="hero">
+    <div class="ghost" aria-hidden="true">X</div>
+    <h1>Bharosa karne se pehle scan karo.</h1>
+    <p class="sub">Link, screenshot ya APK file daalo. ShadowX bataega ki wo safe hai, suspicious hai ya scam, aur kyun.</p>
+  </section>
+
+  <section class="panel" id="panel">
+    <div class="tabs" role="tablist">
+      <button class="tab on" type="button" data-t="url"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Link</span></button>
+      <button class="tab" type="button" data-t="shot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 9"/></svg><span>Screenshot</span></button>
+      <button class="tab" type="button" data-t="apk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg><span>APK file</span></button>
+    </div>
+    <p class="hint" id="hint"></p>
+
+    <div id="p-url">
+      <form id="f">
+        <input id="u" type="text" placeholder="Link paste karo, jaise sbi-login-secure.xyz" autocomplete="off" required>
+        <button class="go" id="b">Scan karo</button>
+      </form>
+      <div class="try">Try karo: <button type="button" class="chip" data-u="chatgpt.com">chatgpt.com</button><button type="button" class="chip" data-u="sbi-login-secure.xyz">sbi-login-secure.xyz</button></div>
+    </div>
+
+    <div id="p-shot" hidden>
+      <label class="drop" id="d-shot">
+        <input type="file" id="fs" accept="image/*">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <strong>Screenshot chuno ya yahan chhod do</strong>
+        <span>Ctrl + V se paste bhi kar sakte ho. Image server pe upload nahi hoti.</span>
+      </label>
+    </div>
+
+    <div id="p-apk" hidden>
+      <label class="drop" id="d-apk">
+        <input type="file" id="fa" accept=".apk,application/vnd.android.package-archive">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <strong>APK file chuno ya yahan chhod do</strong>
+        <span>APK chalayi nahi jaati. File browser mein hi khulti hai.</span>
+      </label>
+    </div>
+
+    <p class="status" id="st" aria-live="polite"></p>
+  </section>
+
+  <section id="out" aria-live="polite"></section>
+  <footer>ShadowX risk ka andaza deta hai, pakka faisla nahi.</footer>
+</main>
+
 <script>
-async function go(){const k=document.getElementById('k').value,v=document.getElementById('t').value;
-const b={kind:k,url:k==='url'?v:'',text:k!=='url'?v:'',sender:document.getElementById('s').value};
-const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-const d=await r.json(),o=document.getElementById('o');
-if(!r.ok){o.textContent=d.detail||'Error';return}
-o.innerHTML='<h3>'+d.verdict.toUpperCase()+' ('+d.score+'/100)</h3>'+d.findings.map(f=>'<div class="f '+f.level+'">'+f.text.replace(/</g,'&lt;')+'</div>').join('')}
-</script></body></html>"""
+const $ = id => document.getElementById(id), out = $('out'), st = $('st'), panel = $('panel');
+const LABEL = {safe:'Safe lag raha hai', suspicious:'Suspicious hai', dangerous:'Khatarnak hai'};
+const COLOR = {safe:'var(--safe)', suspicious:'var(--warn)', dangerous:'var(--danger)'};
+const ADVICE = {
+  safe:'Koi bada red flag nahi mila. Phir bhi OTP ya paisa dene se pehle ek baar sochna.',
+  suspicious:'Kuch cheezein sahi nahi lag rahi. Isme paisa, OTP ya login details mat daalo.',
+  dangerous:'Ye scam ho sakta hai. Isme click mat karo, kuch install mat karo aur kuch share mat karo.'};
+const ICON = {danger:'!', warn:'!', ok:'\u2713', info:'i'};
+const HINT = {
+  url:'Koi bhi link paste karo. Domain, SSL aur page check honge.',
+  shot:'Scam SMS ya chat ka screenshot daalo. Text padh ke scam pattern pakda jaayega.',
+  apk:'APK file chuno. Permissions aur andar ke links check honge.'};
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+function el(tag, cls, text){ const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+function busy(on, msg){ panel.classList.toggle('busy', on); st.textContent = on ? (msg || '') : ''; }
+
+function setTab(t){
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
+  ['url','shot','apk'].forEach(k => $('p-' + k).hidden = (k !== t));
+  $('hint').textContent = HINT[t]; out.textContent = ''; busy(false);
+}
+document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.t)));
+setTab('url');
+
+async function call(payload){
+  const r = await fetch('/api/index', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(d.detail || 'Scan fail ho gaya.');
+  return d;
+}
+function fail(e){ out.textContent = ''; out.append(el('p', 'err', e.message)); }
+
+// ---- link scan
+async function doUrl(v){
+  const btn = $('b'); btn.disabled = true; btn.textContent = 'Scan ho raha hai...'; out.textContent = ''; busy(true);
+  try { render(await call({kind:'url', url:v})); } catch (err) { fail(err); }
+  btn.disabled = false; btn.textContent = 'Scan karo'; busy(false);
+}
+$('f').addEventListener('submit', e => { e.preventDefault(); doUrl($('u').value); });
+document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { $('u').value = c.dataset.u; doUrl(c.dataset.u); }));
+
+// ---- screenshot scan (OCR runs in the browser)
+async function doShot(file){
+  if (!file || !file.type.startsWith('image/')) return;
+  out.textContent = ''; busy(true, 'Screenshot padh raha hai... 0%');
+  try {
+    if (!window.Tesseract) throw new Error('OCR library load nahi hui. Internet check karo aur page refresh karo.');
+    const res = await Tesseract.recognize(file, 'eng', {logger: m => {
+      if (m.status === 'recognizing text') st.textContent = 'Screenshot padh raha hai... ' + Math.round(m.progress * 100) + '%';
+    }});
+    st.textContent = 'Text mil gaya, check ho raha hai...';
+    render(await call({kind:'text', text: res.data.text}));
+  } catch (err) { fail(err); }
+  busy(false);
+}
+$('fs').addEventListener('change', e => { doShot(e.target.files[0]); e.target.value = ''; });
+document.addEventListener('paste', e => {
+  const f = e.clipboardData && e.clipboardData.files && e.clipboardData.files[0];
+  if (f && !$('p-shot').hidden) doShot(f);
+});
+
+// <<AXML
+function parseManifest(buf){
+  const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const strings = [], perms = new Set(); let pkg = '', off = 8;
+  while (off + 8 <= buf.length){
+    const type = v.getUint16(off, true), size = v.getUint32(off + 4, true);
+    if (size < 8) break;
+    if (type === 0x0001){
+      const n = v.getUint32(off + 8, true), flags = v.getUint32(off + 16, true), sStart = v.getUint32(off + 20, true);
+      for (let i = 0; i < n; i++){
+        let p = off + sStart + v.getUint32(off + 28 + i * 4, true);
+        if (flags & 0x100){
+          if (buf[p] & 0x80) p += 2; else p += 1;
+          let bl = buf[p];
+          if (bl & 0x80){ bl = ((bl & 0x7f) << 8) | buf[p + 1]; p += 2; } else p += 1;
+          strings.push(new TextDecoder().decode(buf.subarray(p, p + bl)));
+        } else {
+          let l = v.getUint16(p, true); p += 2;
+          if (l & 0x8000){ l = ((l & 0x7fff) << 16) | v.getUint16(p, true); p += 2; }
+          let s = ''; for (let k = 0; k < l; k++) s += String.fromCharCode(v.getUint16(p + k * 2, true));
+          strings.push(s);
+        }
+      }
+    } else if (type === 0x0102){
+      const aStart = v.getUint16(off + 24, true), aSize = v.getUint16(off + 26, true) || 20, aCount = v.getUint16(off + 28, true);
+      for (let i = 0; i < aCount; i++){
+        const a = off + 16 + aStart + i * aSize;
+        const name = strings[v.getUint32(a + 4, true)], raw = v.getUint32(a + 8, true), dt = v.getUint8(a + 15);
+        const val = raw !== 0xFFFFFFFF ? strings[raw] : (dt === 3 ? strings[v.getUint32(a + 16, true)] : null);
+        if (name === 'package' && val) pkg = val;
+        if (val && /^android\.permission\.[A-Z_]+$/.test(val)) perms.add(val);
+      }
+    }
+    off += size;
+  }
+  return {pkg, perms: [...perms]};
+}
+// AXML>>
+
+async function doApk(file){
+  if (!file) return;
+  out.textContent = ''; busy(true, 'APK khol raha hai...');
+  try {
+    if (!window.JSZip) throw new Error('JSZip load nahi hua. Internet check karo aur page refresh karo.');
+    const buf = await file.arrayBuffer();
+    const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', buf))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const zip = await JSZip.loadAsync(buf);
+    const mf = zip.file('AndroidManifest.xml');
+    if (!mf) throw new Error('Ye valid APK nahi lag rahi (AndroidManifest nahi mila).');
+    const m = parseManifest(await mf.async('uint8array'));
+    st.textContent = 'Andar ke links dhoondh raha hai...';
+    const urls = new Set();
+    for (const f of zip.file(/^classes\d*\.dex$/).slice(0, 3)){
+      const txt = new TextDecoder('latin1').decode(await f.async('uint8array'));
+      for (const u of (txt.match(/https?:\/\/[\w.~:\/?#@!$&*+,;=%-]{4,120}/g) || [])) urls.add(u);
+    }
+    st.textContent = 'Report ban raha hai...';
+    render(await call({kind:'apk', apk:{name:file.name, size:file.size, sha256:hash, package:m.pkg, permissions:m.perms, urls:[...urls].slice(0, 80)}}));
+  } catch (err) { fail(err); }
+  busy(false);
+}
+$('fa').addEventListener('change', e => { doApk(e.target.files[0]); e.target.value = ''; });
+
+// drag and drop
+[['d-shot', doShot], ['d-apk', doApk]].forEach(([id, fn]) => {
+  const z = $(id);
+  z.addEventListener('dragover', e => { e.preventDefault(); z.classList.add('over'); });
+  z.addEventListener('dragleave', () => z.classList.remove('over'));
+  z.addEventListener('drop', e => { e.preventDefault(); z.classList.remove('over'); fn(e.dataTransfer.files[0]); });
+});
+
+// ---- result
+function countUp(node, to){
+  if (reduce || !to){ node.textContent = to; return; }
+  const t0 = performance.now();
+  (function tick(t){ const k = Math.min(1, (t - t0) / 900); node.textContent = Math.round(to * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(tick); })(t0);
+}
+function render(d){
+  out.textContent = '';
+  const card = el('div', 'card'); card.style.setProperty('--c', COLOR[d.verdict]);
+  const res = el('div', 'res'), ring = el('div', 'ring'), num = el('span', null, '0');
+  ring.style.setProperty('--p', d.score); ring.style.setProperty('--c', COLOR[d.verdict]);
+  ring.append(num); countUp(num, d.score);
+  const info = el('div'); info.style.setProperty('--c', COLOR[d.verdict]);
+  info.append(el('div', 'verdict', LABEL[d.verdict]), el('div', 'host', d.host + '  |  Risk score ' + d.score + '/100'), el('p', 'advice', ADVICE[d.verdict]));
+  res.append(ring, info); card.append(res);
+
+  const ul = el('ul', 'list');
+  d.findings.forEach(f => { const li = el('li', f.level); li.append(el('span', 'ic', ICON[f.level] || 'i'), el('span', null, f.text)); ul.append(li); });
+
+  const keys = [];
+  if (!d.apis.virustotal) keys.push('VirusTotal');
+  if (!d.apis.safe_browsing) keys.push('Google Safe Browsing');
+  const note = el('p', 'note', keys.length ? keys.join(' aur ') + ' ki API key abhi set nahi hai, isliye wo check skip hue.' : '');
+  const a = el('a', 'report', 'Scam hua? cybercrime.gov.in ya 1930 pe report karo');
+  a.href = 'https://cybercrime.gov.in'; a.target = '_blank'; a.rel = 'noopener';
+  out.append(card, ul, note, a);
+  card.scrollIntoView({behavior: reduce ? 'auto' : 'smooth', block: 'nearest'});
+}
+</script>
+</body>
+</html>
+'''
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return INDEX_HTML
-
-
-@app.post("/api/scan")
-@app.post("/scan")
-async def scan(req: Req):
-    k = req.kind.lower()
-    if k == "url":
-        return await analyze_url(req.url)
-    if k in ("text", "image", "screenshot"):
-        return await analyze_text(req.text)
-    if k == "sms":
-        return await analyze_sms(req.text, req.sender)
-    if k == "email":
-        return await analyze_email(req.text)
-    if k == "apk":
-        return await analyze_apk(req.apk)
-    raise HTTPException(400, "Unknown scan type.")
+def home():
+    return PAGE
