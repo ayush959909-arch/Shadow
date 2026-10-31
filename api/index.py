@@ -1,7 +1,7 @@
 """ShadowX - Phase 1: URL scanner (FastAPI) for Vercel.
 Optional env keys (set in Vercel > Settings > Environment Variables): VT_API_KEY (VirusTotal), GSB_API_KEY (Google Safe Browsing)
 """
-import asyncio, base64, ipaddress, os, re, socket, ssl
+import asyncio, base64, ipaddress, os, re, socket, ssl, traceback
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 
@@ -18,7 +18,7 @@ app = FastAPI(title="ShadowX")
 VT_KEY = os.getenv("VT_API_KEY")
 GSB_KEY = os.getenv("GSB_API_KEY")
 
-BRANDS = ["sbi", "hdfc", "icici", "axis", "paytm", "phonepe", "gpay", "google", "amazon",
+BRANDS = ["chatgpt", "openai", "telegram", "airtel", "jio", "swiggy", "zomato", "myntra", "sbi", "hdfc", "icici", "axis", "paytm", "phonepe", "gpay", "google", "amazon",
           "flipkart", "paypal", "microsoft", "apple", "netflix", "instagram", "facebook",
           "whatsapp", "irctc", "uidai", "incometax"]
 RISKY_TLDS = {"xyz", "top", "click", "icu", "buzz", "tk", "ml", "ga", "cf", "gq", "work",
@@ -46,14 +46,20 @@ def registered_domain(host: str) -> str:
     return ".".join(parts[-2:])
 
 
-def is_public_host(host: str) -> bool:
-    """SSRF guard: never fetch private/internal addresses."""
+def is_public_host(host: str):
+    """SSRF guard: never fetch private/internal addresses.
+    True = public, False = private or does not resolve, None = DNS lookup itself failed."""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
         return False
+    except OSError:
+        return None
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            return False
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
@@ -82,6 +88,9 @@ def url_checks(url, host, reg, findings):
         add(findings, "warn", f"Domain ending '.{reg.split('.')[-1]}' scams mein bahut use hoti hai.", 15)
     if host.count("-") >= 3 or host.count(".") >= 4:
         add(findings, "warn", "Domain bahut lamba / hyphens ya subdomains se bhara hai.", 10)
+    labels = host.split(".")
+    if len(labels) >= 3 and labels[-2] in {"com", "net", "org", "co", "gov", "edu"} and ".".join(labels[-2:]) not in TWO_PART:
+        add(findings, "warn", f"Domain mein '.{labels[-2]}' ke baad doosri ending lagi hai. Ye asli site jaisa dikhane ki trick hoti hai.", 25)
     label = reg.split(".")[0]
     for b in BRANDS:
         if b in host and label != b:
@@ -203,10 +212,13 @@ async def analyze_url(raw: str):
     findings: list = []
     url_checks(url, host, reg, findings)
     tasks = [domain_age(reg, findings), virustotal(url, findings), safe_browsing(url, findings)]
-    if is_public_host(host):
+    pub = is_public_host(host)
+    if pub:
         tasks += [tls_check(host, findings), page_check(url, findings)]
-    else:
+    elif pub is False:
         add(findings, "warn", "Ye domain resolve nahi ho raha ya internal address hai, isliye page scan nahi hua.", 10)
+    else:
+        add(findings, "info", "Server DNS lookup nahi kar paya, isliye SSL aur page scan skip hue.", 0)
     try:
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=20)
         for res in results:
@@ -514,7 +526,8 @@ async def scan(body: Req):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Server error ({type(e).__name__}: {str(e)[:80]}). Dobara try karo.")
+        tb = traceback.extract_tb(e.__traceback__)[-1]
+        raise HTTPException(500, f"Server error ({type(e).__name__}: {str(e)[:60]}) at {tb.name}:{tb.lineno}")
 
 
 PAGE = r'''<!DOCTYPE html>
