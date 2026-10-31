@@ -109,7 +109,7 @@ async def domain_age(reg, findings):
 
 def _tls_expiry(host):
     ctx = ssl.create_default_context()
-    with socket.create_connection((host, 443), timeout=5) as s:
+    with socket.create_connection((host, 443), timeout=4) as s:
         with ctx.wrap_socket(s, server_hostname=host) as t:
             cert = t.getpeercert()
     return datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
@@ -117,7 +117,7 @@ def _tls_expiry(host):
 
 async def tls_check(host, findings):
     try:
-        exp = await asyncio.to_thread(_tls_expiry, host)
+        exp = _tls_expiry(host)
         left = (exp - datetime.now(timezone.utc)).days
         if left < 0:
             add(findings, "danger", "SSL certificate expire ho chuka hai.", 25)
@@ -133,7 +133,7 @@ async def page_check(url, findings):
     html, cur = "", url
     async with httpx.AsyncClient(timeout=8, headers=UA, follow_redirects=False) as c:
         for _ in range(4):
-            if not await asyncio.to_thread(is_public_host, urlparse(cur).hostname or ""):
+            if not is_public_host(urlparse(cur).hostname or ""):
                 return
             r = await c.get(cur)
             if r.is_redirect and "location" in r.headers:
@@ -203,12 +203,15 @@ async def analyze_url(raw: str):
     findings: list = []
     url_checks(url, host, reg, findings)
     tasks = [domain_age(reg, findings), virustotal(url, findings), safe_browsing(url, findings)]
-    if await asyncio.to_thread(is_public_host, host):
+    if is_public_host(host):
         tasks += [tls_check(host, findings), page_check(url, findings)]
     else:
         add(findings, "warn", "Ye domain resolve nahi ho raha ya internal address hai, isliye page scan nahi hua.", 10)
     try:
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=20)
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=20)
+        for res in results:
+            if isinstance(res, Exception):
+                add(findings, "info", f"Ek check chal nahi paya ({type(res).__name__}).", 0)
     except asyncio.TimeoutError:
         add(findings, "info", "Kuch checks time pe poore nahi hue (site bahut slow hai).", 0)
     r = finish(host, findings)
@@ -511,7 +514,7 @@ async def scan(body: Req):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"Server error ({type(e).__name__}). Dobara try karo.")
+        raise HTTPException(500, f"Server error ({type(e).__name__}: {str(e)[:80]}). Dobara try karo.")
 
 
 PAGE = r'''<!DOCTYPE html>
