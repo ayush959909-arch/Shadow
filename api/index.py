@@ -133,7 +133,7 @@ async def page_check(url, findings):
     html, cur = "", url
     async with httpx.AsyncClient(timeout=8, headers=UA, follow_redirects=False) as c:
         for _ in range(4):
-            if not is_public_host(urlparse(cur).hostname or ""):
+            if not await asyncio.to_thread(is_public_host, urlparse(cur).hostname or ""):
                 return
             r = await c.get(cur)
             if r.is_redirect and "location" in r.headers:
@@ -203,11 +203,14 @@ async def analyze_url(raw: str):
     findings: list = []
     url_checks(url, host, reg, findings)
     tasks = [domain_age(reg, findings), virustotal(url, findings), safe_browsing(url, findings)]
-    if is_public_host(host):
+    if await asyncio.to_thread(is_public_host, host):
         tasks += [tls_check(host, findings), page_check(url, findings)]
     else:
         add(findings, "warn", "Ye domain resolve nahi ho raha ya internal address hai, isliye page scan nahi hua.", 10)
-    await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=20)
+    except asyncio.TimeoutError:
+        add(findings, "info", "Kuch checks time pe poore nahi hue (site bahut slow hai).", 0)
     r = finish(host, findings)
     r["url"] = url
     return r
@@ -488,9 +491,7 @@ async def analyze_apk(a: dict):
 
 
 
-@app.post("/api/index")
-@app.post("/api/scan/url")
-async def scan(body: Req):
+async def dispatch(body: Req):
     if body.kind == "text":
         return await analyze_text(body.text)
     if body.kind == "sms":
@@ -500,6 +501,17 @@ async def scan(body: Req):
     if body.kind == "apk":
         return await analyze_apk(body.apk or {})
     return await analyze_url(body.url)
+
+
+@app.post("/api/index")
+@app.post("/api/scan/url")
+async def scan(body: Req):
+    try:
+        return await dispatch(body)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Server error ({type(e).__name__}). Dobara try karo.")
 
 
 PAGE = r'''<!DOCTYPE html>
